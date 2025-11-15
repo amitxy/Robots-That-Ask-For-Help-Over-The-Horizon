@@ -130,7 +130,14 @@ def get_data_split(data_dir, split_file, is_train=False):
         )
 
     def format_candidates(sample):
-        dom_tree = lxml.etree.fromstring(sample["cleaned_html"])
+        try:
+            dom_tree = lxml.etree.fromstring(sample["cleaned_html"])
+        except Exception as e:
+            # If HTML parsing fails, return empty candidates
+            sample["pos_candidates"] = []
+            sample["neg_candidates"] = []
+            return sample
+            
         positive = []
         for candidate in sample["pos_candidates"]:
             # Handle both dict and string formats
@@ -140,12 +147,13 @@ def get_data_split(data_dir, split_file, is_train=False):
                 candidate_id = candidate
             
             if candidate_id:
-                positive.append(
-                    (
-                        candidate_id,
-                        format_candidate(dom_tree, {"backend_node_id": candidate_id}, keep_html_brackets=False),
-                    )
-                )
+                try:
+                    formatted = format_candidate(dom_tree, {"backend_node_id": candidate_id}, keep_html_brackets=False)
+                    positive.append((candidate_id, formatted))
+                except Exception:
+                    # Skip problematic candidates
+                    continue
+                    
         sample["pos_candidates"] = positive
         negative = []
         for candidate in sample["neg_candidates"]:
@@ -156,17 +164,22 @@ def get_data_split(data_dir, split_file, is_train=False):
                 candidate_id = candidate
             
             if candidate_id:
-                negative.append(
-                    (
-                        candidate_id,
-                        format_candidate(dom_tree, {"backend_node_id": candidate_id}, keep_html_brackets=False),
-                    )
-                )
+                try:
+                    formatted = format_candidate(dom_tree, {"backend_node_id": candidate_id}, keep_html_brackets=False)
+                    negative.append((candidate_id, formatted))
+                except Exception:
+                    # Skip problematic candidates
+                    continue
+                    
         sample["neg_candidates"] = negative
         return sample
 
-    # Apply format_candidates without multiprocessing to avoid pickling lxml objects
-    flatten_dataset = flatten_dataset.map(format_candidates)
+    # Apply format_candidates with multiprocessing for speed
+    flatten_dataset = flatten_dataset.map(
+        format_candidates,
+        num_proc=4,  # Use 4 processes
+        batch_size=50  # Process in larger batches
+    )
 
     if is_train:
         flatten_dataset = flatten_dataset.filter(lambda x: len(x["pos_candidates"]) > 0)
