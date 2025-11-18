@@ -72,10 +72,9 @@ class CERerankingEvaluator:
         num_negatives = []
         with tqdm(total=len(self.samples)) as t:
             for instance in self.samples:
-                query = (
-                    f'task is: {instance["confirmed_task"]}\n'
-                    f'Previous actions: {"; ".join(instance["previous_actions"][-3:])}'
-                )
+                query = f'task is: {instance["confirmed_task"]}'
+                if "previous_actions" in instance and instance["previous_actions"]:
+                    query += f'\nPrevious actions: {"; ".join(instance["previous_actions"][-3:])}'
                 positive = instance["pos_candidates"]
                 negative = instance["neg_candidates"]
                 if self.max_neg > 0 and len(negative) > self.max_neg:
