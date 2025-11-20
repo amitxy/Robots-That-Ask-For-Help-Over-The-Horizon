@@ -47,8 +47,11 @@ def format_input_generation(
         f"Task: {sample['confirmed_task']}\n"
         f"Previous actions:\n"
     )
-    if len(sample["previous_actions"]) > 0:
-        for action in sample["previous_actions"][-previous_k:]:
+    # if len(sample["previous_actions"]) > 0:
+    #     for action in sample["previous_actions"][-previous_k:]:
+    #         seq_input += f"{action}\n"
+    if len(sample["action_reprs"]) > 0:
+        for action in sample["action_reprs"][-previous_k:]:
             seq_input += f"{action}\n"
     else:
         seq_input += "None\n"
@@ -218,7 +221,7 @@ class MultiChoiceDataset(Dataset):
         return model_input
 
 
-def get_data_split(data_dir, split_file, candidate_results=None, is_train=False):
+def get_data_split(data_dir, split_file, candidate_results=None, is_train=False, cache_dir=None):
     def flatten_actions(samples):
         outputs = {
             "website": [],
@@ -231,7 +234,7 @@ def get_data_split(data_dir, split_file, candidate_results=None, is_train=False)
             "neg_candidates": [],
             "cleaned_html": [],
         }
-        num_actions = [len(actions) for actions in samples["actions"]]
+        num_actions = [len(actions) for actions in samples["action_reprs"]]
         for key in ["website", "confirmed_task", "annotation_id"]:
             for idx, value in enumerate(samples[key]):
                 outputs[key] += [value] * num_actions[idx]
@@ -248,25 +251,60 @@ def get_data_split(data_dir, split_file, candidate_results=None, is_train=False)
                     outputs[key].append(action[key])
         return outputs
 
-    dataset = load_dataset(data_dir, data_files=split_file, split="all")
-    flatten_dataset = dataset.map(
-        flatten_actions,
-        batched=True,
-        remove_columns=dataset.column_names,
-        batch_size=10,
-        num_proc=4,
-    )
+    dataset = None
+    if cache_dir is not None:
+        dataset = load_dataset(data_dir, split=split_file, cache_dir=cache_dir)
+    else:
+        dataset = load_dataset(data_dir, data_files=split_file, split="all")
+    
+    
+    # flatten_dataset = dataset.map(
+    #     flatten_actions,
+    #     batched=True,
+    #     remove_columns=dataset.column_names,
+    #     batch_size=10,
+    #     num_proc=4,
+    # )
+    flatten_dataset = dataset
     if candidate_results is not None:
         candidate_scores = candidate_results["scores"]
         candidate_ranks = candidate_results["ranks"]
 
         def get_score(sample):
             sample_id = f"{sample['annotation_id']}_{sample['action_uid']}"
-            for candidates in [sample["pos_candidates"], sample["neg_candidates"]]:
+            for which in ["pos_candidates", "neg_candidates"]:
+                candidates = sample.get(which, [])
+                updated_candidates = []
                 for candidate in candidates:
-                    candidate_id = candidate["backend_node_id"]
-                    candidate["score"] = candidate_scores[sample_id][candidate_id]
-                    candidate["rank"] = candidate_ranks[sample_id][candidate_id]
+                    # Candidate may be a dict or a backend_node_id string
+                    if isinstance(candidate, dict):
+                        candidate_id = candidate.get("backend_node_id")
+                        # Copy to avoid mutating potential shared references
+                        candidate_copy = dict(candidate)
+                    else:
+                        # If it's a string or other scalar, treat as id
+                        candidate_id = candidate
+                        candidate_copy = {"backend_node_id": candidate_id}
+
+                    # Safely get score and rank if available
+                    score = None
+                    rank = None
+                    try:
+                        score = candidate_scores.get(sample_id, {}).get(candidate_id)
+                    except Exception:
+                        score = None
+                    try:
+                        rank = candidate_ranks.get(sample_id, {}).get(candidate_id)
+                    except Exception:
+                        rank = None
+
+                    candidate_copy["score"] = score
+                    candidate_copy["rank"] = rank
+                    updated_candidates.append(candidate_copy)
+
+                # Replace the sample's candidate list with updated list
+                sample[which] = updated_candidates
+
             return {
                 "pos_candidates": sample["pos_candidates"],
                 "neg_candidates": sample["neg_candidates"],
