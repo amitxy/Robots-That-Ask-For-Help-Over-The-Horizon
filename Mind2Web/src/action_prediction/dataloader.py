@@ -18,8 +18,37 @@ sys.path.append(pathlib.Path(__file__).parent.parent.absolute().as_posix())
 from data_utils.dom_utils import get_tree_repr, prune_tree
 
 
+def _parse_operation(operation_field):
+    """Safely parse operation field which can be dict, JSON string, or plain string.
+    Returns (op, value) tuple.
+    """
+    if operation_field is None:
+        return None, None
+    
+    # Already a dict
+    if isinstance(operation_field, dict):
+        return operation_field.get("op"), operation_field.get("value")
+    
+    # Try to parse as JSON string
+    if isinstance(operation_field, str):
+        try:
+            parsed = json.loads(operation_field)
+            if isinstance(parsed, dict):
+                return parsed.get("op"), parsed.get("value")
+        except (json.JSONDecodeError, ValueError):
+            pass
+        # If JSON parsing fails, treat as plain operation string
+        return operation_field, None
+    
+    return None, None
+
+def _extract_candidate_ids(json_txt: str):
+    data = json.loads(json_txt)
+    candidate_id = data.get("backend_node_id")
+    return candidate_id
+
 def format_input_generation(
-    sample, candidate_ids, gt=-1, previous_k=5, keep_html_brackets=False
+    sample, candidate_ids, gt=-1, keep_html_brackets=True
 ):
     dom_tree = lxml.etree.fromstring(sample["cleaned_html"])
     dom_tree = prune_tree(dom_tree, candidate_ids)
@@ -47,11 +76,9 @@ def format_input_generation(
         f"Task: {sample['confirmed_task']}\n"
         f"Previous actions:\n"
     )
-    # if len(sample["previous_actions"]) > 0:
-    #     for action in sample["previous_actions"][-previous_k:]:
-    #         seq_input += f"{action}\n"
+    previous_k = int(sample.get("target_action_index", 0))
     if len(sample["action_reprs"]) > 0:
-        for action in sample["action_reprs"][-previous_k:]:
+        for action in sample["action_reprs"][:previous_k]:
             seq_input += f"{action}\n"
     else:
         seq_input += "None\n"
@@ -64,8 +91,7 @@ def format_input_generation(
     if gt == -1:
         seq_target = "None"
     else:
-        current_action_op = sample["operation"]["op"]
-        current_action_value = sample["operation"]["value"]
+        current_action_op, current_action_value = _parse_operation(sample.get("operation"))
         seq_target = f"Element: {choices[gt][1]}\n"
         seq_target += f"Action: {current_action_op}\n"
         if current_action_op != "CLICK":
@@ -74,13 +100,14 @@ def format_input_generation(
 
 
 def format_input_multichoice(
-    sample, candidate_ids, gt=-1, previous_k=5, keep_html_brackets=False
+    sample, candidate_ids, gt=-1, keep_html_brackets=True
 ):
     dom_tree = lxml.etree.fromstring(sample["cleaned_html"])
     dom_tree = prune_tree(dom_tree, candidate_ids)
     tree_repr, id_mapping = get_tree_repr(
         dom_tree, id_mapping={}, keep_html_brackets=keep_html_brackets
     )
+    
     candidate_nodes = dom_tree.xpath("//*[@backend_node_id]")
     choices = []
     for idx, node in enumerate(candidate_nodes):
@@ -96,14 +123,18 @@ def format_input_multichoice(
                 ),
             ]
         )
-    gt = id_mapping.get(gt, -1)
+
+    gt = id_mapping.get(str(gt), -1)
     seq_input = (
         "Based on the HTML webpage above, try to complete the following task:\n"
         f"Task: {sample['confirmed_task']}\n"
         f"Previous actions:\n"
     )
-    if len(sample["previous_actions"]) > 0:
-        for action in sample["previous_actions"][-previous_k:]:
+  
+    previous_k = int(sample.get("target_action_index", 0))
+ 
+    if len(sample["action_reprs"]) > 0:
+        for action in sample["action_reprs"][:previous_k]:
             seq_input += f"{action}\n"
     else:
         seq_input += "None\n"
@@ -112,20 +143,24 @@ def format_input_multichoice(
         "(If the correct action is not in the page above, please select A. 'None of the above'):\n\n"
         "A. None of the above\n"
     )
+    
     for idx, choice in enumerate(choices):
         # convert to ascii A, B, C, D, ...
-        seq_input += f"{chr(66 + idx)}. {choice[1]}\n"
+        seq_input += f"{chr(66 + idx)}. {choice[1]}\n"  
+   
     if gt == -1:
         seq_target = "A."
     else:
         gt += 1
-        current_action_op = sample["operation"]["op"]
-        current_action_value = sample["operation"]["value"]
+        current_action_op, current_action_value = _parse_operation(sample.get("operation"))
         seq_target = f"{chr(65 + gt)}.\n" f"Action: {current_action_op}\n"
         if current_action_op != "CLICK":
             seq_target += f"Value: {current_action_value}"
     return tree_repr, seq_input, seq_target, choices
 
+
+
+    
 
 class MultiChoiceDataset(Dataset):
     def __init__(
@@ -174,12 +209,14 @@ class MultiChoiceDataset(Dataset):
                 neg_candidates,
                 min(len(neg_candidates), self.num_candidates - 1),
             )
-            gt = pos_candidate["backend_node_id"]
-            candidate_ids = [gt] + [c["backend_node_id"] for c in neg_candidate]
+            gt = _extract_candidate_ids(pos_candidate["backend_node_id"])
+            candidate_ids = [gt] + [_extract_candidate_ids(c["backend_node_id"]) for c in neg_candidate]
+
             if self.mode == "multichoice":
                 seq_context, seq_in, seq_out, _ = format_input_multichoice(
                     sample, candidate_ids, gt
                 )
+                
             else:
                 seq_context, seq_in, seq_out, _ = format_input_generation(
                     sample, candidate_ids, gt
@@ -190,7 +227,7 @@ class MultiChoiceDataset(Dataset):
                 min(len(neg_candidates), self.num_candidates),
             )
             gt = -1
-            candidate_ids = [c["backend_node_id"] for c in neg_candidate]
+            candidate_ids = [_extract_candidate_ids(c["backend_node_id"]) for c in neg_candidate]
             if self.mode == "multichoice":
                 seq_context, seq_in, seq_out, _ = format_input_multichoice(
                     sample, candidate_ids, gt
@@ -199,6 +236,12 @@ class MultiChoiceDataset(Dataset):
                 seq_context, seq_in, seq_out, _ = format_input_generation(
                     sample, candidate_ids, gt
                 )
+        print("==== New Sample ====")
+        print("GT:", gt)
+        print(seq_context,"\n---\n")
+        print(seq_in,"\n---\n")
+        print(seq_out,"\n---\n")
+
 
         seq_context = self.tokenizer(
             seq_context,
