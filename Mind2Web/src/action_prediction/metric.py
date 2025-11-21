@@ -9,7 +9,7 @@ from difflib import SequenceMatcher
 
 import numpy as np
 import torch
-from dataloader import format_input_multichoice
+from action_prediction.dataloader import format_input_multichoice
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
@@ -173,15 +173,17 @@ class ActionEvaluatorMultiChoice:
                         "attention_mask": seq_context["attention_mask"]
                         + seq_in["attention_mask"],
                     }
+                    # Get device from model
+                    device = next(model.parameters()).device
                     model_input = {
                         "input_ids": torch.LongTensor(model_input["input_ids"])
                         .unsqueeze(0)
-                        .to("cuda"),
+                        .to(device),
                         "attention_mask": torch.FloatTensor(
                             model_input["attention_mask"]
                         )
                         .unsqueeze(0)
-                        .to("cuda"),
+                        .to(device),
                     }
 
                     output = model.generate(
@@ -630,15 +632,17 @@ class ActionEvaluatorGeneration:
                         "attention_mask": seq_context["attention_mask"]
                         + seq_in["attention_mask"],
                     }
+                    # Get device from model
+                    device = next(model.parameters()).device
                     model_input = {
                         "input_ids": torch.LongTensor(model_input["input_ids"])
                         .unsqueeze(0)
-                        .to("cuda"),
+                        .to(device),
                         "attention_mask": torch.FloatTensor(
                             model_input["attention_mask"]
                         )
                         .unsqueeze(0)
-                        .to("cuda"),
+                        .to(device),
                     }
 
                     output = model.generate(
