@@ -183,6 +183,14 @@ class MultiChoiceDataset(Dataset):
 
     def __len__(self):
         return len(self.data) * 10
+    
+    def choices_token_ids_mapping(self):
+        """Return a mapping from the candidate choices to thier token ids."""
+        options = [chr(65 + i)  for i in range(self.num_candidates + 1)]
+
+        tokens = self.tokenizer(options, add_special_tokens=False)
+        option_ids = [token_id[0] for token_id in  tokens.input_ids]
+        return dict(zip(options, option_ids))
 
     def __getitem__(self, idx):
         sample = self.data[idx // 10]
@@ -236,11 +244,12 @@ class MultiChoiceDataset(Dataset):
                 seq_context, seq_in, seq_out, _ = format_input_generation(
                     sample, candidate_ids, gt
                 )
-        print("==== New Sample ====")
-        print("GT:", gt)
-        print(seq_context,"\n---\n")
-        print(seq_in,"\n---\n")
-        print(seq_out,"\n---\n")
+        
+        # print(f"==== New Sample ====\n"
+        #       f"GT: {gt}\n"
+        #       f"CONTEXT:\n{seq_context}\n{'-'*20}\n"
+        #       f"INPUT:\n{seq_in}\n{'-'*20}\n"
+        #       f"OUTPUT:\n{seq_out}\n{'-'*20}")
 
 
         seq_context = self.tokenizer(
