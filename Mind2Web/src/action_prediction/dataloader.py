@@ -158,10 +158,6 @@ def format_input_multichoice(
             seq_target += f"Value: {current_action_value}"
     return tree_repr, seq_input, seq_target, choices
 
-
-
-    
-
 class MultiChoiceDataset(Dataset):
     def __init__(
         self,
@@ -194,6 +190,7 @@ class MultiChoiceDataset(Dataset):
 
     def __getitem__(self, idx):
         sample = self.data[idx // 10]
+        # Create a "bias" towards top-k negatives
         if self.top_k > 0:
             top_negatives = [
                 c for c in sample["neg_candidates"] if c["rank"] < self.top_k
@@ -201,6 +198,7 @@ class MultiChoiceDataset(Dataset):
             other_negatives = [
                 c for c in sample["neg_candidates"] if c["rank"] >= self.top_k
             ]
+        # Sample negatives uniformly
         else:
             top_negatives = []
             other_negatives = sample["neg_candidates"]
@@ -367,3 +365,49 @@ def get_data_split(data_dir, split_file, candidate_results=None, is_train=False,
         flatten_dataset = flatten_dataset.filter(lambda x: len(x["pos_candidates"]) > 0)
 
     return flatten_dataset
+
+
+def subsample_by_annotation(
+    dataset,
+    num_annotations=None,
+    frac=None,
+    seed=0,
+    annotation_field="annotation_id",
+):
+    """
+    Subsample a dataset by annotation_id, keeping all actions for each selected id.
+
+    Args:
+        dataset: Dataset with an annotation id column.
+        num_annotations: Number of annotation groups to keep.
+        frac: Fraction of annotation groups to keep (0-1]. Ignored if num_annotations is set.
+        seed: RNG seed for deterministic sampling.
+        annotation_field: Column name that identifies an annotation/task.
+    """
+    if num_annotations is None and frac is None:
+        raise ValueError("Must provide num_annotations or frac for subsampling.")
+
+    # Preserve original order of unique annotation ids
+    unique_annotations = []
+ 
+    for ann in dataset[annotation_field]:
+        if ann not in unique_annotations:
+            unique_annotations.append(ann)
+       
+
+    total_ann = len(unique_annotations)
+    if frac is not None and num_annotations is None:
+        if not (0 < frac <= 1):
+            raise ValueError("frac must be in (0, 1].")
+        num_annotations = max(1, int(total_ann * frac))
+
+    if num_annotations >= total_ann:
+        return dataset
+
+    rng = random.Random(seed)
+    keep_ids = set(rng.sample(unique_annotations, num_annotations))
+
+    # Filtering keeps all rows for the selected annotation ids and preserves intra-id ordering
+    cal_split = dataset.filter(lambda x: x[annotation_field] in keep_ids)
+    test_split = dataset.filter(lambda x: x[annotation_field] not in keep_ids)
+    return cal_split, test_split
