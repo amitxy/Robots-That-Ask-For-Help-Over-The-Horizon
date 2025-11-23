@@ -247,6 +247,10 @@ class MultiChoiceDataset(Dataset):
         
         # seq_out = self.tokenizer(seq_out)
         model_input["labels"] = seq_out#["input_ids"]
+
+        model_input["annotation_id"] = sample["annotation_id"]
+        model_input["action_uid"] = sample["action_uid"]
+        
         return model_input
 
 
