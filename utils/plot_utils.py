@@ -1,6 +1,6 @@
 import matplotlib.pyplot as plt
 
-def plot_accuracy_vs_length(df, correct_col="correct", ann_col="annotation_id"):
+def accuracy_vs_length(df, correct_col="correct", ann_col="annotation_id"):
     # Per-annotation stats
     ann_stats = (
         df.groupby(ann_col)[correct_col]

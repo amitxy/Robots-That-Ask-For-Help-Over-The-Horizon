@@ -1,12 +1,15 @@
-import copy
-import glob
+# import copy
+# import glob
+
+# import pdb
+# import pickle
+import logging
 import json
 import pathlib
-import pdb
-import pickle
 import random
-import re
+# import re
 import sys
+import pandas as pd
 
 import lxml
 import numpy as np
@@ -16,6 +19,8 @@ from torch.utils.data import Dataset
 
 sys.path.append(pathlib.Path(__file__).parent.absolute().as_posix() +"/Mind2Web/src")
 from data_utils.dom_utils import get_tree_repr, prune_tree
+from utils import log_prompt
+
 
 
 def _parse_operation(operation_field):
@@ -131,29 +136,30 @@ def format_input_multichoice(
         f"Previous actions:\n"
     )
   
-    previous_k = int(sample.get("target_action_index", 0))
- 
+    fallback_chr = 'A' #chr(65 + len(candidate_ids))
     if len(sample["action_reprs"]) > 0:
+        previous_k = int(sample.get("target_action_index", 0))
         for action in sample["action_reprs"][:previous_k]:
             seq_input += f"{action}\n"
     else:
         seq_input += "None\n"
     seq_input += (
-        "What should be the next action? Please select from the following choices "
-        "(If the correct action is not in the page above, please select A. 'None of the above'):\n\n"
-        "A. None of the above\n"
+        f"What should be the next action? Please select from the following choices "
+        f"(If the correct action is not in the page above, please select {fallback_chr}. 'None of the above'):\n\n"
+        f"A. None of the above\n"
     )
     
     for idx, choice in enumerate(choices):
         # convert to ascii A, B, C, D, ...
         seq_input += f"{chr(66 + idx)}. {choice[1]}\n"  
-   
+    # seq_input += f"{fallback_chr}. None of the above\n"
+
     if gt == -1:
-        seq_target = "A."
+        seq_target = f"{fallback_chr}."
     else:
-        gt += 1
+        # gt += 1
         current_action_op, current_action_value = _parse_operation(sample.get("operation"))
-        seq_target = f"{chr(65 + gt)}.\n" f"Action: {current_action_op}\n"
+        seq_target = f"{chr(66 + gt)}.\n" f"Action: {current_action_op}\n"
         if current_action_op != "CLICK":
             seq_target += f"Value: {current_action_value}"
     return tree_repr, seq_input, seq_target, choices
@@ -200,8 +206,9 @@ class MultiChoiceDataset(Dataset):
             # Pick the lowest-rank positive (ties broken randomly for stability).
             best_rank = min(c.get("rank", float("inf")) for c in top_pos)
             best_pos = [c for c in top_pos if c.get("rank", float("inf")) == best_rank]
-            pos_candidate = random.choice(best_pos)
+            pos_candidate = random.choice(best_pos)           
             gt = _extract_candidate_ids(pos_candidate["backend_node_id"])
+
         else:
             gt = -1
 
@@ -219,15 +226,10 @@ class MultiChoiceDataset(Dataset):
                     sample, candidate_ids, gt
                 )
        
-     
+
+        log_prompt(sample["annotation_id"], sample["action_uid"], seq_context + seq_in, seq_out, model="flan-xl")
         
-        # print(f"==== New Sample ====\n"
-        #       f"GT: {gt}\n"
-        #       f"CONTEXT:\n{seq_context}\n{'-'*20}\n"
-        #       f"INPUT:\n{seq_in}\n{'-'*20}\n"
-        #       f"OUTPUT:\n{seq_out}\n{'-'*20}")
-
-
+    
         seq_context = self.tokenizer(
             seq_context,
             truncation=True,
@@ -247,10 +249,7 @@ class MultiChoiceDataset(Dataset):
         
         # seq_out = self.tokenizer(seq_out)
         model_input["labels"] = seq_out#["input_ids"]
-
-        model_input["annotation_id"] = sample["annotation_id"]
-        model_input["action_uid"] = sample["action_uid"]
-        
+ 
         return model_input
 
 
@@ -389,3 +388,36 @@ def subsample_by_annotation(
     cal_split = dataset.filter(lambda x: x[annotation_field] in keep_ids)
     test_split = dataset.filter(lambda x: x[annotation_field] not in keep_ids)
     return cal_split, test_split
+
+def build_split_datasets(
+    split_files,
+    tokenizer,
+    seed=42,
+    frac=0.1,
+    num_candidates=5,
+    max_context_len=512,
+    data_dir="osunlp/Multimodal-Mind2Web",
+    cache_dir=None,
+    candidates_dir="candidates",
+):
+    """Return (cal_dict, test_dict) keyed by split name."""
+    cal_dict, test_dict = {}, {}
+    for split_file in split_files:
+        cand_path = f"{candidates_dir}/scores_{split_file}.pkl"
+        candidate_results = pd.read_pickle(cand_path)
+
+        flattened = get_data_split(
+            data_dir=data_dir,
+            split_file=split_file,
+            candidate_results=candidate_results,
+            cache_dir=cache_dir,
+        )
+
+        cal_set, test_set = subsample_by_annotation(flattened, frac=frac, seed=seed)
+        cal_dict[split_file] = MultiChoiceDataset(
+            cal_set, tokenizer, num_candidates=num_candidates, max_context_len=max_context_len
+        )
+        test_dict[split_file] = MultiChoiceDataset(
+            test_set, tokenizer, num_candidates=num_candidates, max_context_len=max_context_len
+        )
+    return cal_dict, test_dict
