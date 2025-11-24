@@ -17,10 +17,9 @@ from datasets import load_dataset
 from lxml import etree
 from torch.utils.data import Dataset
 
-sys.path.append(pathlib.Path(__file__).parent.absolute().as_posix() +"/Mind2Web/src")
-from data_utils.dom_utils import get_tree_repr, prune_tree
-from utils import log_prompt
 
+from utils import log_prompt
+from .data_utils.dom_utils import get_tree_repr, prune_tree
 
 
 def _parse_operation(operation_field):
@@ -137,22 +136,26 @@ def format_input_multichoice(
     )
   
     fallback_chr = 'A' #chr(65 + len(candidate_ids))
+    prev_actions = ''
     if len(sample["action_reprs"]) > 0:
         previous_k = int(sample.get("target_action_index", 0))
         for action in sample["action_reprs"][:previous_k]:
-            seq_input += f"{action}\n"
+            prev_actions += f"{action}\n"
     else:
-        seq_input += "None\n"
+        prev_actions += "None\n"
+    seq_input += prev_actions
     seq_input += (
         f"What should be the next action? Please select from the following choices "
         f"(If the correct action is not in the page above, please select {fallback_chr}. 'None of the above'):\n\n"
-        f"A. None of the above\n"
+        
     )
     
+    choices_str = f"A. None of the above\n"
     for idx, choice in enumerate(choices):
         # convert to ascii A, B, C, D, ...
-        seq_input += f"{chr(66 + idx)}. {choice[1]}\n"  
+        choices_str += f"{chr(66 + idx)}. {choice[1]}\n"  
     # seq_input += f"{fallback_chr}. None of the above\n"
+    seq_input += choices_str
 
     if gt == -1:
         seq_target = f"{fallback_chr}."
@@ -162,7 +165,20 @@ def format_input_multichoice(
         seq_target = f"{chr(66 + gt)}.\n" f"Action: {current_action_op}\n"
         if current_action_op != "CLICK":
             seq_target += f"Value: {current_action_value}"
-    return tree_repr, seq_input, seq_target, choices
+    return tree_repr, seq_input, seq_target, prev_actions, choices_str
+
+
+
+
+class PromptView:
+    """Helper that returns a dict of the raw prompt"""
+    def __init__(self, parent):
+        self._parent = parent
+    
+    def __getitem__(self, idx:int) -> dict:
+
+        return self._parent._get_prompt_element(idx)
+
 
 class MultiChoiceDataset(Dataset):
     def __init__(
@@ -174,11 +190,12 @@ class MultiChoiceDataset(Dataset):
         mode="multichoice",
     ):
         self.data = data
-      
         self.tokenizer = tokenizer
         self.num_candidates = num_candidates
         self.max_context_len = max_context_len
         self.mode = mode
+
+        self.prompt_view = PromptView(self)
 
     def __len__(self):
         return len(self.data)
@@ -190,8 +207,11 @@ class MultiChoiceDataset(Dataset):
         tokens = self.tokenizer(options, add_special_tokens=False)
         option_ids = [token_id[0] for token_id in  tokens.input_ids]
         return dict(zip(options, option_ids))
-
-    def __getitem__(self, idx):
+    
+    def _get_prompt_element(self, idx):
+        """Return the raw prompt elements before tokenization
+        Returns: seq_context, seq_in, seq_out
+        """
         sample = self.data[idx]
         
         all_cands = sample["pos_candidates"] + sample["neg_candidates"]
@@ -217,7 +237,7 @@ class MultiChoiceDataset(Dataset):
         ]
 
         if self.mode == "multichoice":
-                seq_context, seq_in, seq_out, _ = format_input_multichoice(
+                seq_context, seq_in, seq_out, prev_actions, choices_str = format_input_multichoice(
                     sample, candidate_ids, gt
                 )
                 
@@ -226,10 +246,14 @@ class MultiChoiceDataset(Dataset):
                     sample, candidate_ids, gt
                 )
        
-
+        return seq_context, seq_in, seq_out, prev_actions, choices_str
+      
+    def __getitem__(self, idx):
+        sample = self.data[idx]
+        seq_context, seq_in, seq_out, *_ = self._get_prompt_element(idx)
+     
         log_prompt(sample["annotation_id"], sample["action_uid"], seq_context + seq_in, seq_out, model="flan-xl")
         
-    
         seq_context = self.tokenizer(
             seq_context,
             truncation=True,
