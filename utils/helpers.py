@@ -15,9 +15,10 @@ def setup_slurm_env():
         os.environ["TEMP_DIR"] = CACHE_DIR
         os.environ["HF_HOME"] = CACHE_DIR
         # os.environ["TRANSFORMERS_CACHE"] = CACHE_DIR
-        os.environ["HF_DATASETS_CACHE"] = CACHE_DIR
+        os.environ["HF_DATASETS_CACHE"] = CACHE_DIR 
         os.environ["HF_HUB_CACHE"] = CACHE_DIR
         os.environ["TMPDIR"] = CACHE_DIR
+        os.environ["XDG_CACHE_HOME"] = CACHE_DIR
         # os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 def reload(*module_names):
