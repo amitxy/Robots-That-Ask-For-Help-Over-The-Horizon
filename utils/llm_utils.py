@@ -2,7 +2,6 @@ import torch
 import re 
 from typing import Dict, Any, Optional, Tuple
 
-
 _LABEL_RE = re.compile(r"^\s*([A-F])\.", re.IGNORECASE)
 _ACTION_RE = re.compile(r"Action:\s*(CLICK|SELECT|TYPE)", re.IGNORECASE)
 _VALUE_RE  = re.compile(r"Value:\s*(.*)$", re.IGNORECASE | re.MULTILINE)
@@ -29,3 +28,4 @@ def tensorize_item(item: Dict[str, Any], device: str):
     input_ids = torch.LongTensor(item["input_ids"]).unsqueeze(0).to(device)
     attention_mask = torch.LongTensor(item["attention_mask"]).unsqueeze(0).to(device)
     return {"input_ids": input_ids, "attention_mask": attention_mask}
+
