@@ -1,5 +1,32 @@
 import matplotlib.pyplot as plt
 
+
+def nonconformity_histogram(scores, threshold, naive_threshold=None, threshold2=None, naive_threshold2=None):
+    plt.hist(scores, bins=30, edgecolor='k', linewidth=1)
+    plt.axvline(
+        x=threshold, linestyle='--', color='r', label=r'Quantile value ({threshold:.5f}), $\alpha=0.1$'.format(threshold=threshold),
+    )
+    if naive_threshold is not None:
+        plt.axvline(
+            x=naive_threshold, linestyle='--', color='g', label=r'Naive quantile value ({naive_threshold:.5f}), $\alpha=0.1$'.format(naive_threshold=naive_threshold),
+        )
+    if threshold2 is not None:
+        plt.axvline(
+            x=threshold2, linestyle=':', color='r', label=r'Quantile value ({threshold2:.5f}), $\alpha=0.2$'.format(threshold2=threshold2),
+        )
+    if naive_threshold2 is not None:
+        plt.axvline(
+            x=naive_threshold2, linestyle=':', color='g', label=r'Naive quantile value ({naive_threshold2:.5f}), $\alpha=0.2$'.format(naive_threshold2=naive_threshold2),
+        )
+    plt.title(
+        'Histogram of non-conformity scores in the calibration set'
+    )
+    plt.xlabel('Non-conformity score')
+    plt.ylabel('Frequency')
+    plt.legend()
+    plt.show()
+    print('A good predictor should have low non-conformity scores, concentrated at the left side of the figure')
+
 def accuracy_vs_length(df, correct_col="correct", ann_col="annotation_id"):
     # Per-annotation stats
     ann_stats = (
