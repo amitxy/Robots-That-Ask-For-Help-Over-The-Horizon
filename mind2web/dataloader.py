@@ -426,8 +426,12 @@ def build_split_datasets(
 ):
     """Return (cal_dict, test_dict) keyed by split name."""
     cal_dict, test_dict = {}, {}
+    base_cand_dir = pathlib.Path(candidates_dir)
+    if not base_cand_dir.is_absolute():
+        base_cand_dir = pathlib.Path(__file__).resolve().parent.parent / base_cand_dir
+
     for split_file in split_files:
-        cand_path = f"{candidates_dir}/scores_{split_file}.pkl"
+        cand_path = base_cand_dir / f"scores_{split_file}.pkl"
         candidate_results = pd.read_pickle(cand_path)
 
         flattened = get_data_split(

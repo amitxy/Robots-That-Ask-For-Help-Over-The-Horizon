@@ -19,15 +19,18 @@ class ActionEvaluatorMultiChoice:
     def __init__(self, tokenizer) -> None:
         self.tokenizer = tokenizer
 
-    def __call__(self, eval_preds):
+    def __call__(self, eval_preds, decode_before_eval=True):
         preds, labels = eval_preds
         if isinstance(preds, tuple):
             preds = preds[0]
-        decoded_preds = self.tokenizer.batch_decode(preds, skip_special_tokens=True)
-        # Replace -100 in the labels as we can't decode them.
-        labels = np.where(labels != -100, labels, self.tokenizer.pad_token_id)
-        decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
-
+        if decode_before_eval:
+            decoded_preds = self.tokenizer.batch_decode(preds, skip_special_tokens=True)
+            # Replace -100 in the labels as we can't decode them.
+            labels = np.where(labels != -100, labels, self.tokenizer.pad_token_id)
+            decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
+        else:
+            decoded_preds = preds
+            decoded_labels = labels
         # Some simple post-processing
         decoded_preds = [self.postprocess_action(text) for text in decoded_preds]
         decoded_labels = [self.postprocess_action(text) for text in decoded_labels]
