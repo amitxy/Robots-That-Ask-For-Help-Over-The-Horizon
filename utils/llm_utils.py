@@ -1,14 +1,17 @@
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForVision2Seq, AutoProcessor
+from transformers import AutoModelForImageTextToText, AutoProcessor
 from string import Template
 import pandas as pd
 from tqdm.auto import tqdm
 import re 
-from utils.prompts import oracle_prompt_template
+from utils.prompts import oracle_prompt_template, human_prompt_template
 from PIL import Image
 from utils import log_response
 from typing import Dict, Any, Optional, Tuple
+
+
+
 
 
 _LABEL_RE = re.compile(r"^\s*([A-F])\.", re.IGNORECASE)
@@ -27,7 +30,7 @@ def parse_output(text: str) -> Tuple[Optional[str], Optional[str], Optional[str]
     if value == "":
         value = None
 
-    return letter, action, value
+    return letter.strip(), action.strip(), value.strip()
 
 def tensorize_item(item: Dict[str, Any], device: str):
     """
@@ -37,10 +40,6 @@ def tensorize_item(item: Dict[str, Any], device: str):
     input_ids = torch.LongTensor(item["input_ids"]).unsqueeze(0).to(device)
     attention_mask = torch.LongTensor(item["attention_mask"]).unsqueeze(0).to(device)
     return {"input_ids": input_ids, "attention_mask": attention_mask}
-
-# utils.reload('utils')
-
-
 
 def run_evaluation(data_sets:dict,model, tokenizer, max_iter=None, max_new_tokens:int=15, device='cuda') -> pd.DataFrame:
     outputs = []
@@ -102,6 +101,25 @@ def run_evaluation(data_sets:dict,model, tokenizer, max_iter=None, max_new_token
 
     return results_df
 
+class GeminiBase:
+    """An interface class"""
+    def __init__(self, model_name: str, api_key: str = None):
+        # Try to find API key in env or file if not provided
+        if api_key is None:
+            api_key = os.environ.get("GEMINI_API_KEY")
+            if api_key is None and os.path.exists("api.txt"):
+                try:
+                    api_key = open("api.txt", "r").read().strip()
+                except:
+                    pass
+        
+        if not api_key:
+            print("Warning: GEMINI_API_KEY not found. Oracle calls will fail.")
+
+        self.client = genai.Client(api_key=api_key)
+        self.model_name = model_name
+        
+
 
 class Oracle:
     def __init__(
@@ -110,9 +128,11 @@ class Oracle:
         cache_dir: str = None,
         device: str = None,
         dtype=torch.float16,
+        max_image_edge: int = 720,
+        max_tokens: int = 25,
     ):
         self.processor = AutoProcessor.from_pretrained(model_name, cache_dir=cache_dir)
-        self.model = AutoModelForVision2Seq.from_pretrained(
+        self.model = AutoModelForImageTextToText.from_pretrained(
             model_name,
             cache_dir=cache_dir,
             dtype=dtype,
@@ -121,6 +141,9 @@ class Oracle:
         if device is not None:
             self.model.to(device)
         self.device = device or 'cuda'
+        # Downscale large images to save VRAM; keep aspect ratio.
+        self.max_image_edge = max_image_edge
+        self.max_tokens = max_tokens
 
     def _build_prompt(self,
                       task:str,
@@ -137,7 +160,20 @@ class Oracle:
             options=choices,
             prediction_set_options=candidates,
         )
+        
         return prompt
+
+    def _maybe_resize(self, image: Image.Image) -> Image.Image:
+        """Resize so the longer edge is at most max_image_edge."""
+        if image is None or self.max_image_edge is None:
+            return image
+        w, h = image.size
+        longer = max(w, h)
+        if longer <= self.max_image_edge:
+            return image
+        scale = self.max_image_edge / float(longer)
+        new_size = (int(w * scale), int(h * scale))
+        return image.resize(new_size, Image.LANCZOS)
 
     def ask(self,
             task:str,
@@ -151,8 +187,6 @@ class Oracle:
         """
    
         prompt = self._build_prompt(task, prev_actions, html_context, choices, candidates)
-        image =  image.convert("RGB")
-
         messages = [{
             "role": "user",
             "content": [
@@ -161,15 +195,22 @@ class Oracle:
             ],
         }]
         text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = self.processor(images=[image.convert("RGB")], text=[text], return_tensors="pt").to(self.device)
+        
+        if image is not None:
+            image = self._maybe_resize(image)
+            inputs = self.processor(images=[image], text=[text], return_tensors="pt").to(self.device)
+        else:
+            inputs = self.processor(text=[text], return_tensors="pt").to(self.device)
 
         with torch.inference_mode():
             output_ids = self.model.generate(
                 **inputs,
-                max_new_tokens=16,
+                max_new_tokens=self.max_tokens,
                 do_sample=False,
             )
             
-
-        text = self.processor.decode(output_ids[0], skip_special_tokens=True)
-        return text.strip()
+        # Strip the prompt tokens
+        prompt_len = inputs["input_ids"].shape[-1]
+        reply_ids = output_ids[0, prompt_len:]
+        reply_text = self.processor.decode(reply_ids, skip_special_tokens=True).strip()
+        return reply_text
