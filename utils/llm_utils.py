@@ -40,7 +40,7 @@ def tensorize_item(item: Dict[str, Any], device: str):
     return {"input_ids": input_ids, "attention_mask": attention_mask}
 
 
-def choices_probabilities(choices_to_token_ids:dict, logits, pred_set:list=None, filtered_choices_mapping:dict=None) -> dict:
+def choices_probabilities(choices_to_token_ids:dict, logits, pred_set:list=None) -> dict:
     """
     Calculate the probabilities of specific choice tokens from model logits.
 
@@ -56,17 +56,26 @@ def choices_probabilities(choices_to_token_ids:dict, logits, pred_set:list=None,
                      If provided, only probabilities for these choices are returned.
     :type pred_set: list, optional
     :return: A dictionary mapping choice labels to their probabilities (0.0 to 1.0).
-    :param filtered_choices_mapping: dict - mapping of the filtered choices labels to the original labels
     :rtype: dict
     """
+    
+    
     if pred_set is not None:
-        choices_to_token_ids = {k:v for k,v in choices_to_token_ids.items() if k in pred_set}
+        # remap to filtered choices (A,B,...)
+        mapping = {lab:chr(65 +i) for i, lab in enumerate(pred_set)}
+        choices_to_token_ids = {lab:choices_to_token_ids[lab] for lab in mapping }
+        
+    else:
+        mapping = dict(zip(choices_to_token_ids.keys(), choices_to_token_ids.keys()))
+
     choices_idx = torch.tensor(list(choices_to_token_ids.values()), device='cpu')
+
     probs = F.softmax(logits, dim=-1)[:, choices_idx][0]
     choices_probs = dict(zip(choices_to_token_ids.keys(), probs.cpu().tolist()))
     # remap to original labels
-    if filtered_choices_mapping:
-        choices_probs = {filtered_choices_mapping[k]:v for k,v in choices_probs.items()}
+    if len(mapping) < len(choices_to_token_ids):
+        inv_mapping = {v:k for k,v in mapping.items()}
+        choices_probs = {inv_mapping[k]:v for k,v in choices_probs.items()}
     return choices_probs
 
 def run_evaluation(data_sets:dict,model, tokenizer, max_iter=None, max_new_tokens:int=15, device='cuda') -> pd.DataFrame:
@@ -246,11 +255,11 @@ def filter_choices(choices_str: str, pred_set: list[str]):
     """Filter the choices string to only include those in pred_set.
      IMPORTANT: if 'A' (reserved label) is not in the pred_set (unlikely)
       another label will be mapped to 'A'"""
-    mapping = {chr(65 + i): label for i, label in enumerate(pred_set)}
+    mapping = {label: chr(65 + i) for i, label in enumerate(pred_set)}
     mask = list(ord(label) - 65 for label in pred_set)
     choices_strs = choices_str.splitlines()
     filtered_choices_str = '\n'.join(chr(65 + i) + choices_strs[i][1:] for i in mask)
-    return filtered_choices_str, mapping
+    return filtered_choices_str
 
 
 def re_evaluate_with_oracle(test_dict:pd.DataFrame, df:pd.DataFrame, answer_df:pd.DataFrame,model, tokenizer, device='cuda') -> pd.DataFrame:
@@ -265,7 +274,7 @@ def re_evaluate_with_oracle(test_dict:pd.DataFrame, df:pd.DataFrame, answer_df:p
         html_context, seq_in, seq_out, prev_actions, choices_str = test_set.prompt_view[relative_idx]
         task = test_set.data[relative_idx]['confirmed_task']
         
-        filtered_choices_str, choice_mapping = filter_choices(choices_str, row['pred_set'])
+        filtered_choices_str = filter_choices(choices_str, row['pred_set'])
         prompt = prompt_template.safe_substitute(task=task,
                                                  prev_actions=prev_actions,
                                                   choices=filtered_choices_str,
@@ -288,8 +297,7 @@ def re_evaluate_with_oracle(test_dict:pd.DataFrame, df:pd.DataFrame, answer_df:p
                     )
         decoded = tokenizer.decode(out["sequences"][0], skip_special_tokens=True)
         choices_probs = choices_probabilities(test_set.choices_token_ids_mapping(),
-                                             out["scores"][0], pred_set=row['pred_set'],
-                                             filtered_choices_mapping=choice_mapping)
+                                             out["scores"][0], pred_set=row['pred_set'])
         pred_label, pred_action, pred_value = parse_output(decoded)
         outputs.append(
                 [
@@ -305,8 +313,8 @@ def re_evaluate_with_oracle(test_dict:pd.DataFrame, df:pd.DataFrame, answer_df:p
                     decoded
                 ]    
             )
-        break
         log_response(row['annotation_id'], row['action_uid'], decoded)
+        
     cols = ["relative_idx", "annotation_id", "action_uid", "pred_label", "pred_action", "pred_value",
              "label",'label_text', "choices_probs", "prob", "test_split", "text_output"]
     results_df = pd.DataFrame(outputs, columns=cols)
