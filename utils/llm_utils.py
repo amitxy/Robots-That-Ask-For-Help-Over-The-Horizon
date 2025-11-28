@@ -5,14 +5,12 @@ from string import Template
 import pandas as pd
 from tqdm.auto import tqdm
 import re 
-from utils.prompts import oracle_prompt_template, human_prompt_template
+from utils.prompts import oracle_prompt_template, human_prompt_template, re_eval_prompt_template
 from PIL import Image
 from utils import log_response
 from typing import Dict, Any, Optional, Tuple
-
-
-
-
+import os
+from google import genai
 
 _LABEL_RE = re.compile(r"^\s*([A-F])\.", re.IGNORECASE)
 _ACTION_RE = re.compile(r"Action:\s*(CLICK|SELECT|TYPE)", re.IGNORECASE)
@@ -30,7 +28,7 @@ def parse_output(text: str) -> Tuple[Optional[str], Optional[str], Optional[str]
     if value == "":
         value = None
 
-    return letter.strip(), action.strip(), value.strip()
+    return letter, action, value,
 
 def tensorize_item(item: Dict[str, Any], device: str):
     """
@@ -41,13 +39,42 @@ def tensorize_item(item: Dict[str, Any], device: str):
     attention_mask = torch.LongTensor(item["attention_mask"]).unsqueeze(0).to(device)
     return {"input_ids": input_ids, "attention_mask": attention_mask}
 
+
+def choices_probabilities(choices_to_token_ids:dict, logits, pred_set:list=None, filtered_choices_mapping:dict=None) -> dict:
+    """
+    Calculate the probabilities of specific choice tokens from model logits.
+
+    This function extracts the probabilities of tokens corresponding to specific choices
+    (e.g., 'A', 'B', 'C') from the model's output logits. It can optionally filter
+    to a subset of choices.
+
+    :param choices_to_token_ids: A dictionary mapping choice labels (str) to their tokenizer token IDs (int).
+    :type choices_to_token_ids: dict
+    :param logits: The raw output logits from the model. Expected shape (batch_size, vocab_size).
+    :type logits: torch.Tensor
+    :param pred_set: An optional list of choice labels to filter the calculation. 
+                     If provided, only probabilities for these choices are returned.
+    :type pred_set: list, optional
+    :return: A dictionary mapping choice labels to their probabilities (0.0 to 1.0).
+    :param filtered_choices_mapping: dict - mapping of the filtered choices labels to the original labels
+    :rtype: dict
+    """
+    if pred_set is not None:
+        choices_to_token_ids = {k:v for k,v in choices_to_token_ids.items() if k in pred_set}
+    choices_idx = torch.tensor(list(choices_to_token_ids.values()), device='cpu')
+    probs = F.softmax(logits, dim=-1)[:, choices_idx][0]
+    choices_probs = dict(zip(choices_to_token_ids.keys(), probs.cpu().tolist()))
+    # remap to original labels
+    if filtered_choices_mapping:
+        choices_probs = {filtered_choices_mapping[k]:v for k,v in choices_probs.items()}
+    return choices_probs
+
 def run_evaluation(data_sets:dict,model, tokenizer, max_iter=None, max_new_tokens:int=15, device='cuda') -> pd.DataFrame:
     outputs = []
     # Get choice (A,B,...,F) to token id mapping
     choices_to_token_ids = list(data_sets.values())[0].choices_token_ids_mapping()
     choices_idx = torch.tensor(list(choices_to_token_ids.values()), device=device)
 
-    
     for split_idx, (ds_split, ds) in enumerate(data_sets.items()):
         relative_idx = 0
         for i, item in enumerate(tqdm(ds, desc="Generating...")):
@@ -119,7 +146,6 @@ class GeminiBase:
         self.client = genai.Client(api_key=api_key)
         self.model_name = model_name
         
-
 
 class Oracle:
     def __init__(
@@ -214,3 +240,74 @@ class Oracle:
         reply_ids = output_ids[0, prompt_len:]
         reply_text = self.processor.decode(reply_ids, skip_special_tokens=True).strip()
         return reply_text
+
+
+def filter_choices(choices_str: str, pred_set: list[str]):
+    """Filter the choices string to only include those in pred_set.
+     IMPORTANT: if 'A' (reserved label) is not in the pred_set (unlikely)
+      another label will be mapped to 'A'"""
+    mapping = {chr(65 + i): label for i, label in enumerate(pred_set)}
+    mask = list(ord(label) - 65 for label in pred_set)
+    choices_strs = choices_str.splitlines()
+    filtered_choices_str = '\n'.join(chr(65 + i) + choices_strs[i][1:] for i in mask)
+    return filtered_choices_str, mapping
+
+
+def re_evaluate_with_oracle(test_dict:pd.DataFrame, df:pd.DataFrame, answer_df:pd.DataFrame,model, tokenizer, device='cuda') -> pd.DataFrame:
+    prompt_template = Template(re_eval_prompt_template)
+    idx_split_map = {i:split_name for i, split_name in enumerate(test_dict.keys())}
+    # Align answers to the filtered df order
+    answers = answer_df.reindex(df.index)['oracle_answer'].values
+    outputs = []
+    for pos, (_, row) in enumerate(tqdm(df.iterrows(), desc="Re-evaluating with oracle...", total=len(df))):
+        relative_idx = row['relative_idx']
+        test_set = test_dict[idx_split_map[row['test_split']]]
+        html_context, seq_in, seq_out, prev_actions, choices_str = test_set.prompt_view[relative_idx]
+        task = test_set.data[relative_idx]['confirmed_task']
+        
+        filtered_choices_str, choice_mapping = filter_choices(choices_str, row['pred_set'])
+        prompt = prompt_template.safe_substitute(task=task,
+                                                 prev_actions=prev_actions,
+                                                  choices=filtered_choices_str,
+                                                  help=answers[pos])
+                
+        seq_context = tokenizer(html_context,truncation=True,max_length=512,add_special_tokens=False,)
+        seq_in = tokenizer(prompt,add_special_tokens=True,truncation=True,max_length=512)
+        model_input = {
+                    "input_ids": seq_context["input_ids"] + seq_in["input_ids"],
+                    "attention_mask": seq_context["attention_mask"] + seq_in["attention_mask"],
+                }
+        model_input = tensorize_item(model_input, device=device)
+        with torch.inference_mode():
+                    out = model.generate(
+                        **model_input,
+                        eos_token_id=model.config.eos_token_id,
+                        max_new_tokens=20,
+                        return_dict_in_generate=True,
+                        output_scores=True
+                    )
+        decoded = tokenizer.decode(out["sequences"][0], skip_special_tokens=True)
+        choices_probs = choices_probabilities(test_set.choices_token_ids_mapping(),
+                                             out["scores"][0], pred_set=row['pred_set'],
+                                             filtered_choices_mapping=choice_mapping)
+        pred_label, pred_action, pred_value = parse_output(decoded)
+        outputs.append(
+                [
+                    relative_idx,
+                    row['annotation_id'],
+                    row['action_uid'],
+                    pred_label, pred_action, pred_value,
+                    row['label'],
+                    row['label_text'],
+                    choices_probs,
+                    choices_probs.get(pred_label, 0),
+                    row['test_split'],
+                    decoded
+                ]    
+            )
+        break
+        log_response(row['annotation_id'], row['action_uid'], decoded)
+    cols = ["relative_idx", "annotation_id", "action_uid", "pred_label", "pred_action", "pred_value",
+             "label",'label_text', "choices_probs", "prob", "test_split", "text_output"]
+    results_df = pd.DataFrame(outputs, columns=cols)
+    return results_df
