@@ -43,6 +43,18 @@ oracle_prompt_template = textwrap.dedent(
 
 oracle_instruction = "You are a helpful human annotator assisting a web navigation agent. The agent is confused and has narrowed down the next step to a few likely options, but it cannot distinguish which one is correct."
 
+re_eval_prompt_template = textwrap.dedent(
+    """
+Based on the HTML webpage above, try to complete the following task:
+Task: $task
+Previous actions:
+$prev_actions
+Guidance: $help
+What should be the next action? Please select from the following choices (If the correct action is not in the page above, please select A. 'None of the above'):
+
+$choices
+"""
+)
 
 human_prompt_template = textwrap.dedent(
     """
