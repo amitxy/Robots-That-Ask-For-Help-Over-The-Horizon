@@ -248,6 +248,8 @@ class MultiChoiceDataset(Dataset):
                 sample, candidate_ids, gt
             )
             prev_actions, choices_str = "", ""
+        # if seq_out is None:
+        #     seq_out = ""
 
         return seq_context, seq_in, seq_out, prev_actions, choices_str
 
@@ -274,10 +276,16 @@ class MultiChoiceDataset(Dataset):
             truncation=True,
             max_length=self.max_context_len,
         )
+        seq_out_tok = self.tokenizer(
+            seq_out,
+            add_special_tokens=True,
+            truncation=True,
+            max_length=self.max_context_len,
+        )
         model_input = {
             "input_ids": seq_context_tok["input_ids"] + seq_in_tok["input_ids"],
             "attention_mask": seq_context_tok["attention_mask"] + seq_in_tok["attention_mask"],
-            "labels": seq_out,
+            "labels": seq_out_tok["input_ids"],
         }
         return model_input
       
@@ -344,7 +352,8 @@ class MultiChoiceDatasetRandom(MultiChoiceDataset):
         pos = sample.get("pos_candidates", []) or []
         neg = sample.get("neg_candidates", []) or []
         pos_ranks = [c.get("rank") for c in pos if c.get("rank") is not None]
-        best_pos_rank = min(pos_ranks) if pos_ranks else None
+        # Use -1 as a sentinel instead of None to keep collate happy.
+        best_pos_rank = min(pos_ranks) if pos_ranks else -1
         return {
             "num_pos": len(pos),
             "num_neg": len(neg),
@@ -357,8 +366,8 @@ class MultiChoiceDatasetRandom(MultiChoiceDataset):
         sample = self.data[base_idx]
         rng = self._rng_for_idx(idx)
 
-        pos_candidates = sample.get("pos_candidates", []) or []
-        neg_candidates = sample.get("neg_candidates", []) or []
+        pos_candidates = sample.get("pos_candidates", [])
+        neg_candidates = sample.get("neg_candidates", [])
 
         # Optional top-k filtering for negatives
         if self.top_k > 0:
@@ -408,24 +417,9 @@ class MultiChoiceDatasetRandom(MultiChoiceDataset):
             model="flan-xl",
         )
 
-        seq_context = self.tokenizer(
-            seq_context,
-            truncation=True,
-            max_length=self.max_context_len,
-            add_special_tokens=False,
-        )
-        seq_in = self.tokenizer(
-            seq_in,
-            add_special_tokens=True,
-            truncation=True,
-            max_length=self.max_context_len,
-        )
-        model_input = {
-            "input_ids": seq_context["input_ids"] + seq_in["input_ids"],
-            "attention_mask": seq_context["attention_mask"] + seq_in["attention_mask"],
-            "labels": seq_out,
-            "difficulty": self.sample_difficulty(base_idx),
-        }
+        model_input = self._tokenize_prompt(seq_context, seq_in, seq_out)
+
+        # model_input["difficulty"] = self.sample_difficulty(base_idx)
         return model_input
 
 
