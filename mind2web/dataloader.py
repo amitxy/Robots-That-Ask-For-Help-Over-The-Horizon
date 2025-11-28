@@ -413,19 +413,14 @@ def subsample_by_annotation(
     test_split = dataset.filter(lambda x: x[annotation_field] not in keep_ids)
     return cal_split, test_split
 
-def build_split_datasets(
+def build_datasets_dict(
     split_files,
-    tokenizer,
-    seed=42,
-    frac=0.1,
-    num_candidates=5,
-    max_context_len=512,
     data_dir="osunlp/Multimodal-Mind2Web",
     cache_dir=None,
     candidates_dir="candidates",
-):
-    """Return (cal_dict, test_dict) keyed by split name."""
-    cal_dict, test_dict = {}, {}
+) -> dict[str, Dataset]:
+    """Return a dict of Datasets keyed by split name."""
+    ds_map = {}
     base_cand_dir = pathlib.Path(candidates_dir)
     if not base_cand_dir.is_absolute():
         base_cand_dir = pathlib.Path(__file__).resolve().parent.parent / base_cand_dir
@@ -440,12 +435,6 @@ def build_split_datasets(
             candidate_results=candidate_results,
             cache_dir=cache_dir,
         )
-
-        cal_set, test_set = subsample_by_annotation(flattened, frac=frac, seed=seed)
-        cal_dict[split_file] = MultiChoiceDataset(
-            cal_set, tokenizer, num_candidates=num_candidates, max_context_len=max_context_len
-        )
-        test_dict[split_file] = MultiChoiceDataset(
-            test_set, tokenizer, num_candidates=num_candidates, max_context_len=max_context_len
-        )
-    return cal_dict, test_dict
+        ds_map[split_file] = flattened
+       
+    return ds_map
