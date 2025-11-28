@@ -188,12 +188,18 @@ class MultiChoiceDataset(Dataset):
         num_candidates=5,
         max_context_len=512,
         mode="multichoice",
+        cache_prompt=False,
+        cache_tokenized=False,
     ):
         self.data = data
         self.tokenizer = tokenizer
         self.num_candidates = int(num_candidates)
         self.max_context_len = max_context_len
         self.mode = mode
+        self.cache_prompt = cache_prompt
+        self.cache_tokenized = cache_tokenized
+        self._prompt_cache = {}
+        self._token_cache = {}
 
         self.prompt_view = PromptView(self)
 
@@ -208,14 +214,12 @@ class MultiChoiceDataset(Dataset):
         option_ids = [token_id[0] for token_id in  tokens.input_ids]
         return dict(zip(options, option_ids))
     
-    def _get_prompt_element(self, idx):
-        """Return the raw prompt elements before tokenization
-        Returns: seq_context, seq_in, seq_out
-        """
+    def _build_prompt_element(self, idx):
+        """Return the raw prompt elements before tokenization."""
         sample = self.data[idx]
-        
+
         all_cands = sample["pos_candidates"] + sample["neg_candidates"]
-        
+
         all_cands_sorted = sorted(
             all_cands, key=lambda c: c.get("rank", float("inf"))
         )[: self.num_candidates]
@@ -226,9 +230,8 @@ class MultiChoiceDataset(Dataset):
             # Pick the lowest-rank positive (ties broken randomly for stability).
             best_rank = min(c.get("rank", float("inf")) for c in top_pos)
             best_pos = [c for c in top_pos if c.get("rank", float("inf")) == best_rank]
-            pos_candidate = random.choice(best_pos)           
+            pos_candidate = random.choice(best_pos)
             gt = _extract_candidate_ids(pos_candidate["backend_node_id"])
-
         else:
             gt = -1
 
@@ -237,23 +240,174 @@ class MultiChoiceDataset(Dataset):
         ]
 
         if self.mode == "multichoice":
-                seq_context, seq_in, seq_out, prev_actions, choices_str = format_input_multichoice(
-                    sample, candidate_ids, gt
-                )
-                
+            seq_context, seq_in, seq_out, prev_actions, choices_str = format_input_multichoice(
+                sample, candidate_ids, gt
+            )
         else:
-                seq_context, seq_in, seq_out, _ = format_input_generation(
-                    sample, candidate_ids, gt
-                )
-       
+            seq_context, seq_in, seq_out, _ = format_input_generation(
+                sample, candidate_ids, gt
+            )
+            prev_actions, choices_str = "", ""
+
         return seq_context, seq_in, seq_out, prev_actions, choices_str
+
+    def _get_prompt_element(self, idx):
+        """Return cached or freshly built prompt elements (raw strings)."""
+        if not self.cache_prompt:
+            return self._build_prompt_element(idx)
+        cached = self._prompt_cache.get(idx)
+        if not cached:
+            cached = self._build_prompt_element(idx)
+            self._prompt_cache[idx] = cached
+        return cached
+
+    def _tokenize_prompt(self, seq_context, seq_in, seq_out):
+        seq_context_tok = self.tokenizer(
+            seq_context,
+            truncation=True,
+            max_length=self.max_context_len,
+            add_special_tokens=False,
+        )
+        seq_in_tok = self.tokenizer(
+            seq_in,
+            add_special_tokens=True,
+            truncation=True,
+            max_length=self.max_context_len,
+        )
+        model_input = {
+            "input_ids": seq_context_tok["input_ids"] + seq_in_tok["input_ids"],
+            "attention_mask": seq_context_tok["attention_mask"] + seq_in_tok["attention_mask"],
+            "labels": seq_out,
+        }
+        return model_input
       
     def __getitem__(self, idx):
         sample = self.data[idx]
+        if self.cache_tokenized:
+            cached = self._token_cache.get(idx)
+            if cached:
+                return cached
+
         seq_context, seq_in, seq_out, *_ = self._get_prompt_element(idx)
-     
         log_prompt(sample["annotation_id"], sample["action_uid"], seq_context + seq_in, seq_out, model="flan-xl")
-        
+
+        model_input = self._tokenize_prompt(seq_context, seq_in, seq_out)
+
+        if self.cache_tokenized:
+            self._token_cache[idx] = model_input
+        return model_input
+
+
+class MultiChoiceDatasetRandom(MultiChoiceDataset):
+    """
+    A variant that samples candidates on each __getitem__, matching the
+    original Mind2Web behavior.
+    No repeated factor like in the original implementation, instead use RandomSampler:
+    from torch.utils.data import DataLoader, RandomSampler
+
+    dataset = MultiChoiceDatasetRandom(...)
+    sampler = RandomSampler(dataset, replacement=True, num_samples=len(dataset) * 3)
+    loader = DataLoader(dataset, batch_size=bs, sampler=sampler, num_workers=4, pin_memory=True)
+    """
+
+    def __init__(
+        self,
+        data,
+        tokenizer,
+        num_candidates=5,
+        max_context_len=512,
+        mode="multichoice",
+        neg_ratio=0.1, #0.2,
+        top_k=-1,
+        seed=0,
+    ):
+        super().__init__(
+            data=data,
+            tokenizer=tokenizer,
+            num_candidates=num_candidates,
+            max_context_len=max_context_len,
+            mode=mode,
+        )
+        self.neg_ratio = neg_ratio
+        self.top_k = top_k
+        self.seed = seed
+
+    def __len__(self):
+        return len(self.data)
+
+    def _rng_for_idx(self, idx: int) -> random.Random:
+        return random.Random(self.seed + idx)
+
+    def sample_difficulty(self, idx: int) -> dict:
+        """Return simple difficulty signals for a base sample index."""
+        sample = self.data[idx]
+        pos = sample.get("pos_candidates", []) or []
+        neg = sample.get("neg_candidates", []) or []
+        pos_ranks = [c.get("rank") for c in pos if c.get("rank") is not None]
+        best_pos_rank = min(pos_ranks) if pos_ranks else None
+        return {
+            "num_pos": len(pos),
+            "num_neg": len(neg),
+            "has_pos": len(pos) > 0,
+            "best_pos_rank": best_pos_rank,
+        }
+
+    def __getitem__(self, idx):
+        base_idx = idx
+        sample = self.data[base_idx]
+        rng = self._rng_for_idx(idx)
+
+        pos_candidates = sample.get("pos_candidates", []) or []
+        neg_candidates = sample.get("neg_candidates", []) or []
+
+        # Optional top-k filtering for negatives
+        if self.top_k > 0:
+            top_negatives = [
+                c for c in neg_candidates if c.get("rank", float("inf")) < self.top_k
+            ]
+            other_negatives = [
+                c for c in neg_candidates if c.get("rank", float("inf")) >= self.top_k
+            ]
+        else:
+            top_negatives = []
+            other_negatives = neg_candidates
+
+        neg_pool = top_negatives if (rng.random() < 0.8 and top_negatives) else other_negatives
+
+        # Decide whether to include a positive candidate
+        if pos_candidates and (rng.random() > self.neg_ratio or not neg_pool):
+            pos_candidate = rng.choice(pos_candidates)
+            neg_sample = rng.sample(
+                neg_pool, min(len(neg_pool), self.num_candidates - 1)
+            )
+            gt = _extract_candidate_ids(pos_candidate["backend_node_id"])
+            candidate_ids = [gt] + [
+                _extract_candidate_ids(c["backend_node_id"]) for c in neg_sample
+            ]
+        else:
+            neg_sample = rng.sample(neg_pool, min(len(neg_pool), self.num_candidates))
+            gt = -1
+            candidate_ids = [
+                _extract_candidate_ids(c["backend_node_id"]) for c in neg_sample
+            ]
+
+        if self.mode == "multichoice":
+            seq_context, seq_in, seq_out, prev_actions, choices_str = format_input_multichoice(
+                sample, candidate_ids, gt
+            )
+        else:
+            seq_context, seq_in, seq_out, _ = format_input_generation(
+                sample, candidate_ids, gt
+            )
+
+        log_prompt(
+            sample["annotation_id"],
+            sample["action_uid"],
+            seq_context + seq_in,
+            seq_out,
+            model="flan-xl",
+        )
+
         seq_context = self.tokenizer(
             seq_context,
             truncation=True,
@@ -269,11 +423,9 @@ class MultiChoiceDataset(Dataset):
         model_input = {
             "input_ids": seq_context["input_ids"] + seq_in["input_ids"],
             "attention_mask": seq_context["attention_mask"] + seq_in["attention_mask"],
+            "labels": seq_out,
+            "difficulty": self.sample_difficulty(base_idx),
         }
-        
-        # seq_out = self.tokenizer(seq_out)
-        model_input["labels"] = seq_out#["input_ids"]
- 
         return model_input
 
 
