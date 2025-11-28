@@ -191,7 +191,7 @@ class MultiChoiceDataset(Dataset):
     ):
         self.data = data
         self.tokenizer = tokenizer
-        self.num_candidates = num_candidates
+        self.num_candidates = int(num_candidates)
         self.max_context_len = max_context_len
         self.mode = mode
 
