@@ -1,7 +1,20 @@
 
 import textwrap
+standard_prompt_template = textwrap.dedent(
+"""
+$html
+Based on the HTML webpage above, try to complete the following task:
+Task: $task
+Previous actions:
+$prev_actions
 
+What should be the next action? Please select from the following choices (If the correct action is not in the page above, please select A. 'None of the above'):
+
+$choices
+"""
+)
 # Templates uses $ instead of {}
+# Change to human orale
 oracle_prompt_template = textwrap.dedent(
     """
     ### ROLE
@@ -41,17 +54,13 @@ oracle_prompt_template = textwrap.dedent(
     Your Response:  
 """)
 
-oracle_instruction = "You are a helpful human annotator assisting a web navigation agent. The agent is confused and has narrowed down the next step to a few likely options, but it cannot distinguish which one is correct."
-
 re_eval_prompt_template = textwrap.dedent(
-    """
-Based on the HTML webpage above, try to complete the following task:
+    """Based on the HTML webpage above, try to complete the following task:
 Task: $task
+Guidence: $help
 Previous actions:
 $prev_actions
-Guidance: $help
 What should be the next action? Please select from the following choices (If the correct action is not in the page above, please select A. 'None of the above'):
-
 $choices
 """
 )
@@ -93,3 +102,17 @@ human_prompt_template = textwrap.dedent(
 
 
 
+
+# """
+
+# Task: Find the 'Submit' button.
+# Choices:
+# A. None of the above
+# B. <button id=0> Cancel
+# C. <button id=1> Submit
+# D. <div id=2> Footer
+
+# Think step by step. First "Reasoning:", then "Answer:".
+
+
+# """

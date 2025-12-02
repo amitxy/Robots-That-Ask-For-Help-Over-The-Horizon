@@ -276,16 +276,16 @@ class MultiChoiceDataset(Dataset):
             truncation=True,
             max_length=self.max_context_len,
         )
-        seq_out_tok = self.tokenizer(
-            seq_out,
-            add_special_tokens=True,
-            truncation=True,
-            max_length=self.max_context_len,
-        )
+        # seq_out_tok = self.tokenizer(
+        #     seq_out,
+        #     add_special_tokens=True,
+        #     truncation=True,
+        #     max_length=self.max_context_len,
+        # )
         model_input = {
             "input_ids": seq_context_tok["input_ids"] + seq_in_tok["input_ids"],
             "attention_mask": seq_context_tok["attention_mask"] + seq_in_tok["attention_mask"],
-            "labels": seq_out_tok["input_ids"],
+            "labels": seq_out #seq_out_tok["input_ids"],
         }
         return model_input
       
@@ -300,6 +300,11 @@ class MultiChoiceDataset(Dataset):
         log_prompt(sample["annotation_id"], sample["action_uid"], seq_context + seq_in, seq_out, model="flan-xl")
 
         model_input = self._tokenize_prompt(seq_context, seq_in, seq_out)
+        
+        # Add metadata
+        model_input["annotation_id"] = sample["annotation_id"]
+        model_input["action_uid"] = sample["action_uid"]
+        model_input["idx"] = idx
 
         if self.cache_tokenized:
             self._token_cache[idx] = model_input
@@ -325,7 +330,7 @@ class MultiChoiceDatasetRandom(MultiChoiceDataset):
         num_candidates=5,
         max_context_len=512,
         mode="multichoice",
-        neg_ratio=0.1, #0.2,
+        neg_ratio=0.05, #0.2,
         top_k=-1,
         seed=0,
     ):
@@ -384,7 +389,7 @@ class MultiChoiceDatasetRandom(MultiChoiceDataset):
         neg_pool = top_negatives if (rng.random() < 0.8 and top_negatives) else other_negatives
 
         # Decide whether to include a positive candidate
-        if pos_candidates and (rng.random() > self.neg_ratio or not neg_pool):
+        if pos_candidates and (rng.random() > self.neg_ratio or not neg_pool): #  neg_ratio=0.2
             pos_candidate = rng.choice(pos_candidates)
             neg_sample = rng.sample(
                 neg_pool, min(len(neg_pool), self.num_candidates - 1)
@@ -418,8 +423,9 @@ class MultiChoiceDatasetRandom(MultiChoiceDataset):
         )
 
         model_input = self._tokenize_prompt(seq_context, seq_in, seq_out)
-
         # model_input["difficulty"] = self.sample_difficulty(base_idx)
+
+        model_input["base_idx"] = base_idx
         return model_input
 
 

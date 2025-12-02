@@ -10,5 +10,5 @@ from utils.helpers import (
     reload
 )
 
-from . import llm_utils as llm
-from . import plot_utils as plot
+from utils import llm_utils as llm
+from utils import plot_utils as plot
