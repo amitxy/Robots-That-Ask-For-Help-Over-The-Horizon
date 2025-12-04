@@ -4,7 +4,9 @@ import logging
 from datetime import datetime
 import importlib
 import sys
-
+import pandas as pd
+from utils import llm_utils  # for parse_output
+import torch
 SLURM_PATH = '/home/yandex/MLWG2025/amitr5'
 CACHE_DIR = f'{SLURM_PATH}/tmp/hf_cache' 
 
@@ -69,3 +71,58 @@ def log_response(annotation_id, action_id, response):
 
 # Initialize loggers
 logger = setup_logger(name="logger")
+
+
+def add_eval_columns(df: pd.DataFrame, threshold: float = None) -> pd.DataFrame:
+    """
+    Add derived evaluation columns.
+
+    Expects columns:
+      - pred_label: predicted letter (e.g., 'A')
+      - label: true letter
+      - choices_probs: dict mapping letter -> probability
+
+    Adds:
+      - correct, true_prob, pred_prob
+      - pred_set, pred_set_size if threshold is provided (include labels where 1 - prob <= threshold)
+    """
+    df = df.copy()
+    
+    for col, suffix in (("target_text", "target"), ("output_text","pred")):
+        parsed = df[col].apply(lambda t: llm_utils.parse_output(t))
+        df[f"{suffix}_label"]= parsed.apply(lambda x: x[0])
+        df[f"{suffix}_action"] = parsed.apply(lambda x: x[1])
+        df[f"{suffix}_value"] = parsed.apply(lambda x: x[2])
+
+    df["correct"] = df["pred_label"] == df["target_label"]
+    df["true_prob"] = df.apply(lambda r: r["choices_probs"].get(r["target_label"], 0.0),axis=1)
+    df["pred_prob"] = df.apply(lambda r: r["choices_probs"].get(r["pred_label"], 0.0), axis=1)
+
+
+    if threshold is not None:
+        df["pred_set"] = df['choices_probs'].apply(lambda row: [ label for label, prob in row.items() if 1 - prob <= threshold])
+        df["pred_set_size"] = df["pred_set"].apply(len)
+
+    return df
+
+
+def softmax_with_temperature_from_probs(choices_probs: dict, temperature: float = 6.0) -> dict:
+    """
+    Given a dict of choice->probabilities, convert to logits (log-prob) and
+    re-apply softmax with the provided temperature. Returns a new dict of probs.
+    """
+    if not isinstance(choices_probs, dict) or len(choices_probs) == 0:
+        return {}
+    # convert to a fixed order for stability
+    items = sorted(choices_probs.items())
+    labels, probs = zip(*items)
+    probs = torch.tensor(probs, dtype=torch.float32)
+    logits = torch.log(probs + 1e-12)  # avoid log(0)
+    scaled = logits / temperature
+    new_probs = torch.softmax(scaled, dim=-1).cpu().tolist()
+    return dict(zip(labels, new_probs))
+
+def choices_logits(logits) -> dict:
+    """
+    
+    """
