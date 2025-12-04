@@ -5,10 +5,19 @@ from datetime import datetime
 import importlib
 import sys
 import pandas as pd
-from utils import llm_utils  # for parse_output
 import torch
+import re 
+from typing import Dict, Any, Optional, Tuple
+
 SLURM_PATH = '/home/yandex/MLWG2025/amitr5'
 CACHE_DIR = f'{SLURM_PATH}/tmp/hf_cache' 
+
+
+_LABEL_RE = re.compile(r"^\s*([A-F])\.", re.IGNORECASE)
+_ACTION_RE = re.compile(r"Action:\s*(CLICK|SELECT|TYPE)", re.IGNORECASE)
+_VALUE_RE  = re.compile(r"Value:\s*(.*)$", re.IGNORECASE | re.MULTILINE)
+
+
 
 
 def setup_slurm_env():
@@ -89,14 +98,14 @@ def add_eval_columns(df: pd.DataFrame, threshold: float = None) -> pd.DataFrame:
     df = df.copy()
     
     for col, suffix in (("target_text", "target"), ("output_text","pred")):
-        parsed = df[col].apply(lambda t: llm_utils.parse_output(t))
+        parsed = df[col].apply(lambda t: parse_output(t))
         df[f"{suffix}_label"]= parsed.apply(lambda x: x[0])
         df[f"{suffix}_action"] = parsed.apply(lambda x: x[1])
         df[f"{suffix}_value"] = parsed.apply(lambda x: x[2])
 
     df["correct"] = df["pred_label"] == df["target_label"]
-    df["true_prob"] = df.apply(lambda r: r["choices_probs"].get(r["target_label"], 0.0),axis=1)
-    df["pred_prob"] = df.apply(lambda r: r["choices_probs"].get(r["pred_label"], 0.0), axis=1)
+    # df["true_prob"] = df.apply(lambda r: r["choices_probs"].get(r["target_label"], 0.0),axis=1)
+    # df["pred_prob"] = df.apply(lambda r: r["choices_probs"].get(r["pred_label"], 0.0), axis=1)
 
 
     if threshold is not None:
@@ -122,7 +131,37 @@ def softmax_with_temperature_from_probs(choices_probs: dict, temperature: float 
     new_probs = torch.softmax(scaled, dim=-1).cpu().tolist()
     return dict(zip(labels, new_probs))
 
-def choices_logits(logits) -> dict:
+def choices_logits(logits, choice2token_id) -> dict:
     """
-    
+    Extract logits for the provided choice->token_id mapping.
     """
+    choices_ids = torch.tensor(list(choice2token_id.values()), device='cpu', dtype=torch.long)
+    choice2logit = dict(zip(choice2token_id.keys(), logits[choices_ids].cpu().tolist()))
+    return choice2logit
+
+def choices_softmax(label_logits: dict, temperature: float = 1.0) -> dict:
+    """
+    Given a dict of label -> logit, return a dict of label -> softmax prob.
+    Supports optional temperature scaling.
+    """
+    if not isinstance(label_logits, dict) or len(label_logits) == 0:
+        return {}
+    items = sorted(label_logits.items())
+    labels, vals = zip(*items)
+    t = torch.tensor(vals, dtype=torch.float32)
+    probs = torch.softmax(t / float(temperature), dim=-1).tolist()
+    return dict(zip(labels, probs))
+
+def parse_output(text: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    letter_match = _LABEL_RE.search(text)
+    letter = letter_match.group(1).upper() if letter_match else None
+
+    action_match = _ACTION_RE.search(text)
+    action = action_match.group(1).upper() if action_match else None
+
+    value_match = _VALUE_RE.search(text)
+    value = value_match.group(1).strip() if value_match else None
+    if value == "":
+        value = None
+
+    return letter, action, value

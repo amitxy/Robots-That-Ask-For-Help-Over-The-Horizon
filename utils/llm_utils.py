@@ -1,3 +1,4 @@
+from mind2web.dataloader import MultiChoiceDataset
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -5,19 +6,20 @@ from transformers import AutoModelForImageTextToText, AutoProcessor, AutoTokeniz
 from string import Template
 import pandas as pd
 from tqdm.auto import tqdm
-import re 
+
 from utils.prompts import oracle_prompt_template, re_eval_prompt_template, standard_prompt_template
 from PIL import Image
-from utils import log_response
-
 from typing import Dict, Any, Optional, Tuple
 import os
 from google import genai
 import gc
 
-_LABEL_RE = re.compile(r"^\s*([A-F])\.", re.IGNORECASE)
-_ACTION_RE = re.compile(r"Action:\s*(CLICK|SELECT|TYPE)", re.IGNORECASE)
-_VALUE_RE  = re.compile(r"Value:\s*(.*)$", re.IGNORECASE | re.MULTILINE)
+
+import utils
+from utils import log_response
+from utils.helpers import parse_output  # for parse_output
+from mind2web.dataloader import MultiChoiceDataset
+
 
 
 import logging
@@ -33,20 +35,6 @@ handler.setFormatter(formatter)
 
 
 
-
-def parse_output(text: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    letter_match = _LABEL_RE.search(text)
-    letter = letter_match.group(1).upper() if letter_match else None
-
-    action_match = _ACTION_RE.search(text)
-    action = action_match.group(1).upper() if action_match else None
-
-    value_match = _VALUE_RE.search(text)
-    value = value_match.group(1).strip() if value_match else None
-    if value == "":
-        value = None
-
-    return letter, action, value,
 
 def tensorize_item(item: Dict[str, Any], device: str):
     """
@@ -66,7 +54,8 @@ def tensorize_item(item: Dict[str, Any], device: str):
         attention_mask = attention_mask.unsqueeze(0)
     return {"input_ids": input_ids, "attention_mask": attention_mask}
 
-def choices_probabilities(choices_to_token_ids:dict, logits, pred_set:list=None) -> dict:
+
+def choices_probabilities(logits, pred_set:list=None, temperature=1) -> dict:
     """
     Calculate the probabilities of specific choice tokens from model logits.
 
@@ -84,22 +73,25 @@ def choices_probabilities(choices_to_token_ids:dict, logits, pred_set:list=None)
     :return: A dictionary mapping choice labels to their probabilities (0.0 to 1.0).
     :rtype: dict
     """
-    choices = choices_to_token_ids
+    if temperature < 0:
+            raise ValueError("Temperature must be non-negative")
+    
+    choices = MultiChoiceDataset.choice2token_id
     
     if pred_set:
         # remap to filtered choices (A,B,...)
         mapping = {lab:chr(65 +i) for i, lab in enumerate(pred_set)}
-        choices = {lab:choices_to_token_ids[mapping[lab]] for lab in pred_set }
+        choices = {lab:choices[mapping[lab]] for lab in pred_set }
         # choices = {lab:choices_to_token_ids[lab] for lab in pred_set }
         
     # else:
-    #     mapping = dict(zip(choices_to_token_ids.keys(), choices_to_token_ids.keys()))
+    #     mapping = dict(zip(choice2token_id.keys(), choice2token_id.keys()))
 
-    choices_idx = torch.tensor(list(choices.values()), device='cpu')
-
-    probs = F.softmax(logits[:, choices_idx], dim=-1)[0]
-    #F.softmax(logits, dim=-1)[:, choices_idx][0]
+    choices_idx = torch.tensor(list(choices.values()), device='cpu', dtype=torch.long)
     
+    probs = F.softmax(logits[choices_idx] / temperature, dim=-1)
+    #F.softmax(logits, dim=-1)[:, choices_idx][0]
+
     choices_probs = dict(zip(choices.keys(), probs.cpu().tolist()))
     # remap to original labels
     # if pred_set:
@@ -110,7 +102,7 @@ def choices_probabilities(choices_to_token_ids:dict, logits, pred_set:list=None)
 def run_evaluation(data_sets:dict,model, tokenizer, max_iter=None, max_new_tokens:int=15, device='cuda') -> pd.DataFrame:
     outputs = []
     # Get choice (A,B,...,F) to token id mapping
-    choices_to_token_ids = list(data_sets.values())[0].choices_token_ids_mapping()
+    choices_to_token_ids = MultiChoiceDataset.choice2token_id
     choices_idx = torch.tensor(list(choices_to_token_ids.values()), device=device)
 
     for split_idx, (ds_split, ds) in enumerate(data_sets.items()):
@@ -131,13 +123,13 @@ def run_evaluation(data_sets:dict,model, tokenizer, max_iter=None, max_new_token
      
             decoded = tokenizer.decode(out["sequences"][0], skip_special_tokens=True)
             pred_label, pred_action, pred_value = parse_output(decoded)
-            labels_tokens = item.get("labels")
+            labels_tokens = item.get("labels")[0]
             
             # Calculate choice probabilities
             logits = out["scores"][0]
             probs = F.softmax(logits, dim=-1)[:, choices_idx][0]
             choices_probs = dict(zip(choices_to_token_ids.keys(), probs.cpu().tolist()))
-            labels = item.get("labels").strip()
+            labels = tokenizer.decode(labels_tokens, skip_special_tokens=True)
             outputs.append(
                     [
                         relative_idx,
@@ -184,8 +176,6 @@ class GeminiBase:
         self.client = genai.Client(api_key=api_key)
         self.model_name = model_name
         
-
-
 class QwenBase:
     def __init__(
         self,
@@ -397,15 +387,6 @@ def re_evaluate_with_oracle(test_dict:pd.DataFrame, df:pd.DataFrame, answer_df:p
 
     new_correct = 0
     for pos, (_, row) in enumerate(tqdm(df.iterrows(), desc="Re-evaluating with oracle...", total=len(df))):
-      
-
-        i =  30
-        if row['action_uid'] !='9e9d839b-645c-4dc2-b821-14098c653005' or row['annotation_id']!='9223f1b4-43ad-4636-9541-99ff9e6ad918':continue
-        # if pos < i:
-        #     continue
-        # if pos > i:
-        #     break
-
         relative_idx = row['relative_idx']
         test_set = test_dict[idx_split_map[row['test_split']]]
         html_context, seq_in, seq_out, prev_actions, choices_str = test_set.prompt_view[relative_idx]
@@ -434,24 +415,22 @@ def re_evaluate_with_oracle(test_dict:pd.DataFrame, df:pd.DataFrame, answer_df:p
                         output_scores=True
                     )
         decoded = tokenizer.decode(out["sequences"][0], skip_special_tokens=True)
-        # choices_probs = choices_probabilities(test_set.choices_token_ids_mapping(),
-                                            #  out["scores"][0], pred_set=None)#row['pred_set']
-        choices_probs = choices_probabilities(test_set.choices_token_ids_mapping(),
-                                             out["scores"][0], pred_set=row['pred_set'])
+       
+        choices_probs = choices_probabilities(out["scores"][0], pred_set=row['pred_set'])
         pred_label, pred_action, pred_value = parse_output(decoded)
         # print(f"Choices probs (full): {choices_probs0}")
         # print(f"Choices probs (filtered): {choices_probs}")
-        if pos > 0:
-            print(html_context)
-            print(prompt)
-            print(f"Decoded: {decoded}, pred: {pred_label}, label: {row['label']}, Original pred: {row['pred_label']}")
-            print(f'pred set: {row["pred_set"]}, choices_probs: {choices_probs}')
-            print(f"-------------------------")
-            print(row['choices_probs'])
-            return
-        new_correct += int(pred_label == row['label'])
-        if pos % 100 == 0:
-            tqdm.write(f"{new_correct}/{pos+1}({new_correct/(pos+1):.2f})")
+        # if pos > 0:
+        #     print(html_context)
+        #     print(prompt)
+        #     print(f"Decoded: {decoded}, pred: {pred_label}, label: {row['label']}, Original pred: {row['pred_label']}")
+        #     print(f'pred set: {row["pred_set"]}, choices_probs: {choices_probs}')
+        #     print(f"-------------------------")
+        #     print(row['choices_probs'])
+        #     return
+        # new_correct += int(pred_label == row['label'])
+        # if pos % 100 == 0:
+        #     tqdm.write(f"{new_correct}/{pos+1}({new_correct/(pos+1):.2f})")
         
 
         # return
@@ -543,7 +522,7 @@ def re_evaluate_with_oracle_batch(
                     relative_idx,
                     row,
                     test_set,
-                    test_set.choices_token_ids_mapping(),
+                    MultiChoiceDataset.choice2token_id,
                 )
             )
 
@@ -587,7 +566,7 @@ def re_evaluate_with_oracle_batch(
             decoded = tokenizer.decode(out["sequences"][b_idx], skip_special_tokens=True)
             logits_first = out["scores"][0][b_idx].unsqueeze(0)
             choices_probs = choices_probabilities(
-                choice_map, logits_first, pred_set=row["pred_set"]
+                logits_first, pred_set=row["pred_set"]
             )
             pred_label, pred_action, pred_value = parse_output(decoded)
             new_correct += int(pred_label == row["label"])
@@ -632,3 +611,44 @@ def re_evaluate_with_oracle_batch(
         "text_output",
     ]
     return pd.DataFrame(outputs, columns=cols)
+
+def batch_generate(model, tokenizer, loader, split_name = None, temperature=1):
+    records = []
+    test_split_idx = MultiChoiceDataset.split2id[split_name] if split_name else -1
+    for batch in loader:
+        with torch.inference_mode():
+            out = model.generate(
+                input_ids=batch['input_ids'],
+                attention_mask=batch['attention_mask'],
+                max_new_tokens=25,
+                eos_token_id=model.config.eos_token_id,
+                do_sample=False,
+                output_scores = True,
+                return_dict_in_generate=True,
+            )
+            out_texts = tokenizer.batch_decode(out["sequences"], skip_special_tokens=True)
+
+            # Labels may contain ignore_index (-100); replace with pad id before decoding
+            labels = batch["labels"]
+            pad_id = tokenizer.pad_token_id or 0
+            labels_to_decode = labels.clone()
+            labels_to_decode[labels_to_decode < 0] = pad_id
+            target_texts = tokenizer.batch_decode(labels_to_decode, skip_special_tokens=True)
+            
+            # in_text = tokenizer.batch_decode(batch['input_ids'],skip_special_tokens=True)
+            
+            for i in range(len(out_texts)):
+                records.append(
+                    {
+                        "relative_idx": batch["ids"][i],
+                        "annotation_id": batch["annotation_ids"][i],
+                        "action_uid": batch["action_uids"][i],
+                        "output_text": out_texts[i],
+                        "target_text": target_texts[i],
+                        "choices_logits": utils.helpers.choices_logits(out['scores'][0][i], MultiChoiceDataset.choice2token_id),
+                        "test_split" : test_split_idx,
+                    }
+                )
+
+    return records
+

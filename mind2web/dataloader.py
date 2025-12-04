@@ -15,8 +15,9 @@ import lxml
 import numpy as np
 from datasets import load_dataset
 from lxml import etree
+import torch
 from torch.utils.data import Dataset
-
+from torch.nn.utils.rnn import pad_sequence
 
 from utils import log_prompt
 from .data_utils.dom_utils import get_tree_repr, prune_tree
@@ -167,8 +168,13 @@ def format_input_multichoice(
             seq_target += f"Value: {current_action_value}"
     return tree_repr, seq_input, seq_target, prev_actions, choices_str
 
+def choice2token_id_mapping(tokenizer, num_choices):
+        """Return a mapping from the candidate choices to thier token ids."""
+        options = [chr(65 + i)  for i in range(num_choices + 1)]
 
-
+        tokens = tokenizer(options, add_special_tokens=False)
+        mapping = {char: token_id_list[0] for char, token_id_list in zip(options, tokens.input_ids)}
+        return mapping
 
 class PromptView:
     """Helper that returns a dict of the raw prompt"""
@@ -180,7 +186,42 @@ class PromptView:
         return self._parent._get_prompt_element(idx)
 
 
+
+
 class MultiChoiceDataset(Dataset):
+    """
+    Mind2Web multi-choice dataset wrapper.
+
+    Each item builds a textual context (HTML context + previous actions) and a
+    multiple-choice prompt over candidate elements, returning tokenized inputs
+    and labels suitable for seq2seq generation.
+    The multiple-choices are deterministic here (always take the top num_candidates)
+
+    Args:
+        data: HF Dataset or list of samples with pos/neg candidates and HTML.
+        tokenizer: Hugging Face tokenizer used for encoding.
+        num_candidates: Max candidates to include per sample (excludes the
+            fallback \"None of the above\").
+        max_context_len: Max tokens for context/prompt segments.
+        mode: \"multichoice\" or \"generation\" formatting.
+        cache_prompt: Cache raw prompt pieces per sample (process-local shared dict).
+        cache_tokenized: Cache tokenized model inputs per sample (process-local shared dict).
+
+    __getitem__ returns a dict with:
+        - input_ids: list[int], concatenated context + prompt token ids
+        - attention_mask: list[int], same length as input_ids
+        - labels: sequence for training (string or token ids depending on formatting)
+        - annotation_id, action_uid, idx: metadata for tracking
+    """
+    # Shared caches across instances
+    id2split = {0: "test_task", 1: "test_domain", 2: "test_website"}
+    split2id = {v: k for k, v in id2split.items()}
+    choice2token_id = {}
+    # caches
+    _prompt_cache = {}
+    _token_cache = {}
+
+
     def __init__(
         self,
         data,
@@ -198,21 +239,23 @@ class MultiChoiceDataset(Dataset):
         self.mode = mode
         self.cache_prompt = cache_prompt
         self.cache_tokenized = cache_tokenized
-        self._prompt_cache = {}
-        self._token_cache = {}
 
         self.prompt_view = PromptView(self)
+
+        # Generate choice2token_id once
+        if not MultiChoiceDataset.choice2token_id and self.tokenizer is not None:
+            MultiChoiceDataset.choice2token_id = choice2token_id_mapping(self.tokenizer, self.num_candidates)
 
     def __len__(self):
         return len(self.data)
     
-    def choices_token_ids_mapping(self):
-        """Return a mapping from the candidate choices to thier token ids."""
-        options = [chr(65 + i)  for i in range(self.num_candidates + 1)]
-
-        tokens = self.tokenizer(options, add_special_tokens=False)
-        option_ids = [token_id[0] for token_id in  tokens.input_ids]
-        return dict(zip(options, option_ids))
+    def _cache_key(self, idx, sample=None):
+        """Stable cache key shared across instances."""
+        sample = sample or self.data[idx]
+        act_uid = sample.get("action_uid")
+        if not act_uid:
+            raise ValueError("Missing action_uid in sample")
+        return act_uid
     
     def _build_prompt_element(self, idx):
         """Return the raw prompt elements before tokenization."""
@@ -224,7 +267,7 @@ class MultiChoiceDataset(Dataset):
             all_cands, key=lambda c: c.get("rank", float("inf"))
         )[: self.num_candidates]
 
-        # Ground-truth is the best-ranked positive within the top-k (if any).
+ 
         top_pos = [c for c in all_cands_sorted if c in sample["pos_candidates"]]
         if top_pos:
             # Pick the lowest-rank positive (ties broken randomly for stability).
@@ -248,8 +291,6 @@ class MultiChoiceDataset(Dataset):
                 sample, candidate_ids, gt
             )
             prev_actions, choices_str = "", ""
-        # if seq_out is None:
-        #     seq_out = ""
 
         return seq_context, seq_in, seq_out, prev_actions, choices_str
 
@@ -257,10 +298,11 @@ class MultiChoiceDataset(Dataset):
         """Return cached or freshly built prompt elements (raw strings)."""
         if not self.cache_prompt:
             return self._build_prompt_element(idx)
-        cached = self._prompt_cache.get(idx)
+        key = self._cache_key(idx)
+        cached = self._prompt_cache.get(key)
         if not cached:
             cached = self._build_prompt_element(idx)
-            self._prompt_cache[idx] = cached
+            self._prompt_cache[key] = cached
         return cached
 
     def _tokenize_prompt(self, seq_context, seq_in, seq_out):
@@ -272,31 +314,37 @@ class MultiChoiceDataset(Dataset):
         )
         seq_in_tok = self.tokenizer(
             seq_in,
+            truncation=True,
+            max_length=self.max_context_len,
+            add_special_tokens=True,
+        )
+
+        seq_out_tok = self.tokenizer(
+            seq_out,
             add_special_tokens=True,
             truncation=True,
             max_length=self.max_context_len,
         )
-        # seq_out_tok = self.tokenizer(
-        #     seq_out,
-        #     add_special_tokens=True,
-        #     truncation=True,
-        #     max_length=self.max_context_len,
-        # )
+
         model_input = {
             "input_ids": seq_context_tok["input_ids"] + seq_in_tok["input_ids"],
             "attention_mask": seq_context_tok["attention_mask"] + seq_in_tok["attention_mask"],
-            "labels": seq_out #seq_out_tok["input_ids"],
+            "labels": seq_out_tok['input_ids']
         }
+
+
         return model_input
       
     def __getitem__(self, idx):
         sample = self.data[idx]
         if self.cache_tokenized:
-            cached = self._token_cache.get(idx)
+            key = self._cache_key(idx, sample)
+            cached = self._token_cache.get(key)
             if cached:
                 return cached
 
         seq_context, seq_in, seq_out, *_ = self._get_prompt_element(idx)
+        
         log_prompt(sample["annotation_id"], sample["action_uid"], seq_context + seq_in, seq_out, model="flan-xl")
 
         model_input = self._tokenize_prompt(seq_context, seq_in, seq_out)
@@ -307,21 +355,10 @@ class MultiChoiceDataset(Dataset):
         model_input["idx"] = idx
 
         if self.cache_tokenized:
-            self._token_cache[idx] = model_input
+            self._token_cache[key] = model_input
         return model_input
 
-
 class MultiChoiceDatasetRandom(MultiChoiceDataset):
-    """
-    A variant that samples candidates on each __getitem__, matching the
-    original Mind2Web behavior.
-    No repeated factor like in the original implementation, instead use RandomSampler:
-    from torch.utils.data import DataLoader, RandomSampler
-
-    dataset = MultiChoiceDatasetRandom(...)
-    sampler = RandomSampler(dataset, replacement=True, num_samples=len(dataset) * 3)
-    loader = DataLoader(dataset, batch_size=bs, sampler=sampler, num_workers=4, pin_memory=True)
-    """
 
     def __init__(
         self,
@@ -332,7 +369,7 @@ class MultiChoiceDatasetRandom(MultiChoiceDataset):
         mode="multichoice",
         neg_ratio=0.05, #0.2,
         top_k=-1,
-        seed=0,
+        seed=42,
     ):
         super().__init__(
             data=data,
@@ -414,6 +451,7 @@ class MultiChoiceDatasetRandom(MultiChoiceDataset):
                 sample, candidate_ids, gt
             )
 
+
         log_prompt(
             sample["annotation_id"],
             sample["action_uid"],
@@ -425,7 +463,10 @@ class MultiChoiceDatasetRandom(MultiChoiceDataset):
         model_input = self._tokenize_prompt(seq_context, seq_in, seq_out)
         # model_input["difficulty"] = self.sample_difficulty(base_idx)
 
-        model_input["base_idx"] = base_idx
+        model_input["idx"] = base_idx
+        model_input["annotation_id"] = sample["annotation_id"]
+        model_input["action_uid"] = sample["action_uid"]
+        
         return model_input
 
 
@@ -590,3 +631,24 @@ def build_datasets_dict(
         ds_map[split_file] = flattened
        
     return ds_map
+
+def multichoice_collate_fn(batch, device='cuda', token_pad_id=0, label_pad_id=-100):
+    """
+    Convert the model_input dict returned by MultiChoiceDataset.__getitem__
+    (lists of ints) or a collated batch (tensors) into tensors appropriate for model generate.
+    """
+    input_ids = [torch.tensor(item["input_ids"]).to(device) for item in batch]
+    attention_mask = [torch.tensor(item["attention_mask"]).to(device) for item in batch]
+    labels  = [torch.tensor(item["labels"]) for item in batch]
+
+    # Add padding
+    input_ids = pad_sequence(input_ids, batch_first=True, padding_value=token_pad_id)
+    attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
+    labels = pad_sequence(labels, batch_first=True, padding_value=label_pad_id)
+    out = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+
+    # Add addional information
+    out["ids"] = [ex["idx"] for ex in batch]
+    out["annotation_ids"] = [ex["annotation_id"] for ex in batch]
+    out["action_uids"] = [ex["action_uid"] for ex in batch]
+    return out
