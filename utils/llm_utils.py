@@ -2,7 +2,7 @@ from mind2web.dataloader import MultiChoiceDataset
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from transformers import AutoModelForImageTextToText, AutoProcessor, AutoTokenizer
+from transformers import AutoModelForImageTextToText, AutoProcessor, AutoTokenizer, LogitsProcessor, LogitsProcessorList
 from string import Template
 import pandas as pd
 from tqdm.auto import tqdm
@@ -18,7 +18,8 @@ import gc
 import utils
 from utils import log_response
 from utils.helpers import parse_output  # for parse_output
-from mind2web.dataloader import MultiChoiceDataset
+from mind2web.dataloader import MultiChoiceDataset, multichoice_collate_fn, choice2token_id
+
 
 
 
@@ -612,10 +613,50 @@ def re_evaluate_with_oracle_batch(
     ]
     return pd.DataFrame(outputs, columns=cols)
 
-def batch_generate(model, tokenizer, loader, split_name = None, temperature=1):
+
+
+
+
+class ShrinkageTokenProcessor(LogitsProcessor):
+    def __init__(self, token_ids, shrinkage=0, device=None):
+        if shrinkage < 0 or shrinkage > 1:
+            raise ValueError("Shrinkage penalty must be between 0 and 1")
+        
+        self.shrinkage = shrinkage # Shrinkage penalty
+        ids = sorted(set(token_ids)) # Makes sure that shrinkage applied only once
+        self.shrink_ids = torch.tensor(ids, dtype=torch.long, device=device)
+
+        # Indicator for making sure that shrinkage is applied only on the first token generation
+        self._applied = False 
+
+    def __call__(self, input_ids, scores):
+        if self._applied:
+            return scores
+        
+        # # Softmax is shift-invariant
+        # min_abs_score = scores.min(dim=1, keepdim=True).values.abs()
+        # scores += min_abs_score
+
+        # replace inf/NaN with a large negative sentinel
+        finite_scores = torch.nan_to_num(scores, neginf=-1e9, posinf=1e9)
+        # per-row offset to make the min ~0
+        offset = (-finite_scores.min(dim=1, keepdim=True).values).clamp(min=0) + 1e-6
+        scores = scores + offset  # softmax is shift-invariant
+
+        # min_vals = scores.min(dim=1, keepdim=True).values
+        # scores = scores - min_vals + 1e-6
+        
+        scores[:, self.shrink_ids] *=  (1.0 - self.shrinkage)
+        # scores[:, self.shrink_ids] = scores[:, self.shrink_ids] * (1.0 - self.shrinkage)
+        self._applied = True
+        return scores
+
+
+def batch_generate(model, tokenizer, loader, split_name = None, temperature=1, shrinkage=0):
     records = []
     test_split_idx = MultiChoiceDataset.split2id[split_name] if split_name else -1
     for batch in loader:
+        processors = LogitsProcessorList([ShrinkageTokenProcessor([choice2token_id['A']], shrinkage=shrinkage)])
         with torch.inference_mode():
             out = model.generate(
                 input_ids=batch['input_ids'],
@@ -625,6 +666,7 @@ def batch_generate(model, tokenizer, loader, split_name = None, temperature=1):
                 do_sample=False,
                 output_scores = True,
                 return_dict_in_generate=True,
+                logits_processor=processors,
             )
             out_texts = tokenizer.batch_decode(out["sequences"], skip_special_tokens=True)
 
@@ -645,10 +687,36 @@ def batch_generate(model, tokenizer, loader, split_name = None, temperature=1):
                         "action_uid": batch["action_uids"][i],
                         "output_text": out_texts[i],
                         "target_text": target_texts[i],
-                        "choices_logits": utils.helpers.choices_logits(out['scores'][0][i], MultiChoiceDataset.choice2token_id),
+                        "choices_logits": utils.helpers.choices_logits(out['scores'][0][i], choice2token_id),
                         "test_split" : test_split_idx,
                     }
                 )
 
     return records
+
+def run_split_random(split_name, ds, model, tokenizer, batch_size=7, num_iterations=1, temperature=1, shrinkage=0):
+    all_records  = []
+    for rand_idx in range(num_iterations):
+        # Clear GPU memory before next iteration
+        torch.cuda.empty_cache()
+        gc.collect()
+        # ds.seed = rand_idx #####
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=multichoice_collate_fn)
+        results = batch_generate(model, tokenizer, loader, split_name=split_name, temperature=temperature, shrinkage=shrinkage)
+        records = pd.DataFrame(results)
+        records['rand_idx'] = rand_idx
+        all_records.append(records)
+
+    final_df = pd.concat(all_records, ignore_index=True)
+    return final_df
+
+def evaluate_splits(data_sets:dict, model, tokenizer, batch_size=7, num_iterations=1, shrinkage=0):
+    all_splits = []
+    for split_name, ds in data_sets.items():
+        print(f"Evaluating split: {split_name}")
+        split_df = run_split_random(split_name, ds, model, tokenizer, batch_size=batch_size, num_iterations=num_iterations, shrinkage=shrinkage)
+        all_splits.append(split_df)
+    
+    final_df = pd.concat(all_splits, ignore_index=True)
+    return final_df
 

@@ -4,6 +4,7 @@ import logging
 from datetime import datetime
 import importlib
 import sys
+from pathlib import Path
 import pandas as pd
 import torch
 import re 
@@ -83,8 +84,16 @@ def log_response(annotation_id, action_id, response):
 # Initialize loggers
 logger = setup_logger(name="logger")
 
+def _logits_to_probs(logits_dict, logits_temp: float = 1) -> dict:
+        if not isinstance(logits_dict, dict) or len(logits_dict) == 0:
+            return {}
+        items = sorted(logits_dict.items())
+        labels, vals = zip(*items)
+        t = torch.tensor(vals, dtype=torch.float32)
+        probs = torch.softmax(t / float(logits_temp), dim=-1).tolist()
+        return dict(zip(labels, probs))
 
-def add_eval_columns(df: pd.DataFrame, threshold: float = None) -> pd.DataFrame:
+def add_eval_columns(df: pd.DataFrame, threshold: float = None, logits_temp: float = 1, to_save: bool = False, save_path: str = None) -> pd.DataFrame:
     """
     Add derived evaluation columns.
 
@@ -96,9 +105,12 @@ def add_eval_columns(df: pd.DataFrame, threshold: float = None) -> pd.DataFrame:
     Adds:
       - correct, true_prob, pred_prob
       - pred_set, pred_set_size if threshold is provided (include labels where 1 - prob <= threshold)
+      - choices_probs from choices_logits if logits_temp is provided (softmax with temperature)
     """
     df = df.copy()
-    
+
+    df["choices_probs"] = df["choices_logits"].apply(lambda x: _logits_to_probs(x, logits_temp=logits_temp))
+
     for col, suffix in (("target_text", "target"), ("output_text","pred")):
         parsed = df[col].apply(lambda t: parse_output(t))
         df[f"{suffix}_label"]= parsed.apply(lambda x: x[0])
@@ -106,14 +118,18 @@ def add_eval_columns(df: pd.DataFrame, threshold: float = None) -> pd.DataFrame:
         df[f"{suffix}_value"] = parsed.apply(lambda x: x[2])
 
     df["correct"] = df["pred_label"] == df["target_label"]
-    # df["true_prob"] = df.apply(lambda r: r["choices_probs"].get(r["target_label"], 0.0),axis=1)
-    # df["pred_prob"] = df.apply(lambda r: r["choices_probs"].get(r["pred_label"], 0.0), axis=1)
+    df["target_prob"] = df.apply(lambda r: r["choices_probs"].get(r["target_label"], 0.0),axis=1)
+    df["pred_prob"] = df.apply(lambda r: r["choices_probs"].get(r["pred_label"], 0.0), axis=1)
 
 
     if threshold is not None:
         df["pred_set"] = df['choices_probs'].apply(lambda row: [ label for label, prob in row.items() if 1 - prob <= threshold])
         df["pred_set_size"] = df["pred_set"].apply(len)
 
+    if to_save and save_path:
+        full_path = Path("results") / save_path
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_pickle(full_path)
     return df
 
 
@@ -168,6 +184,23 @@ def parse_output(text: str) -> Tuple[Optional[str], Optional[str], Optional[str]
 
     return letter, action, value
 
+
+def filter_to_calibration_actions(
+    full_df,
+    cal_dict,
+):
+    """
+    Keep only rows in full_df whose (action_uid)
+    appear in cal_dict.
+    """
+    filtered_dfs = []
+    for split in cal_dict.keys():
+        anotations = cal_dict[split].action_uids()
+        df = full_df[full_df['action_uid'].isin(anotations)]
+        filtered_dfs.append(df)
+
+    all_filtered = pd.concat(filtered_dfs)
+    return all_filtered
 
 @dataclass
 class LambdaResult:
@@ -232,25 +265,23 @@ def tune_lambda_group_risk(
         # 5) Point predictions
         y_pred = np.argmax(penalized, axis=1)                     # (N,)
 
-        # 6) Per-annotation risky event
-        risky_A_per_ann = np.zeros(G, dtype=bool)
-        for g, mask in enumerate(group_masks):
-            if not mask.any():
-                # Should not happen, but be robust
-                continue
-            yp_g = y_pred[mask]
-            yt_g = y_cal_int[mask]
-            # risky_A_per_ann[g] = np.any((yp_g == label_A) & (yt_g != label_A))
-            # risky_A_per_ann[g] = np.sum((yp_g == label_A) & (yt_g != label_A))/ max(np.sum(yt_g != label_A),1)  # avoid divide by zero
-            # risky_A_per_ann[g] = np.sum((yp_g == label_A) & (yt_g == label_A))/ max(np.sum(yt_g == label_A),1)
-            # risky_A_per_ann[g] = np.sum((yp_g == label_A) & (yt_g == label_A))/ max(np.sum(yp_g == label_A),1)
+        # # 6) Per-annotation risky event
+        # risky_A_per_ann = np.zeros(G, dtype=bool)
+        # for g, mask in enumerate(group_masks):
+        #     if not mask.any():
+        #         # Should not happen, but be robust
+        #         continue
+        #     yp_g = y_pred[mask]
+        #     yt_g = y_cal_int[mask]
+        #     # risky_A_per_ann[g] = np.any((yp_g == label_A) & (yt_g != label_A))
+        #     risky_A_per_ann[g] = np.sum((yp_g == label_A) & (yt_g != label_A))/ max(np.sum(yt_g != label_A),1)
 
-        risk_hat = risky_A_per_ann.mean()
+        # risk_hat = risky_A_per_ann.mean()
 
-        #  # 6) Global mean FPR for "A": P( predict A | true != A )
-        # is_false_A = (y_pred == label_A) & (y_cal_int != label_A)
-        # denom = np.sum(y_cal_int != label_A)
-        # risk_hat = float(is_false_A.sum() / max(denom, 1))
+         # 6) Global mean FPR for "A": P( predict A | true != A )
+        is_false_A = (y_pred == label_A) & (y_cal_int != label_A)
+        denom = np.sum(y_cal_int != label_A)
+        risk_hat = float(is_false_A.sum() / max(denom, 1))
 
         
         
@@ -282,7 +313,36 @@ def tune_lambda_group_risk(
     # Smallest feasible lambda
     best = min(feasible, key=lambda r: r.lam)
 
-    print( max(feasible, key=lambda r: (r.recall, -r.lam)))
-
     return best.lam, results
 
+
+def best_lambda_from_df(
+    cal_df: dict,
+    alpha: float = 0.1,
+    lambda_grid: np.ndarray | None = None,
+    label_map: dict | None = None,
+) -> tuple[float, dict]:
+    """
+    Filter df to calibration actions and compute best lambda (lambda_hat)
+    using tune_lambda_group_risk.
+    """
+    if lambda_grid is None:
+        lambda_grid = np.linspace(0.0, 1.0, 1000)
+
+    if label_map is None:
+        label_map = {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4, "F": 5}
+
+    # 2) make sure evaluation columns exist (choices_logits, target_label, etc.)
+    cal_df_proc = add_eval_columns(cal_df)
+
+    # 3) build y_cal
+    y_cal = cal_df_proc["target_label"].map(label_map)
+
+    # 4) run lambda tuning
+    best_lambda, results = tune_lambda_group_risk(
+        cal_df=cal_df_proc,
+        y_cal=y_cal,
+        alpha=alpha,
+        lambda_grid=lambda_grid,
+    )
+    return best_lambda, results
