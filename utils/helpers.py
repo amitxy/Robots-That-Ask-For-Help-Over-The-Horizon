@@ -8,6 +8,8 @@ import pandas as pd
 import torch
 import re 
 from typing import Dict, Any, Optional, Tuple
+from dataclasses import dataclass
+import numpy as np
 
 SLURM_PATH = '/home/yandex/MLWG2025/amitr5'
 CACHE_DIR = f'{SLURM_PATH}/tmp/hf_cache' 
@@ -165,3 +167,122 @@ def parse_output(text: str) -> Tuple[Optional[str], Optional[str], Optional[str]
         value = None
 
     return letter, action, value
+
+
+@dataclass
+class LambdaResult:
+    lam: float
+    risk_hat: float         # empirical risky-A fraction of risky annotations
+    acc: float              # overall accuracy (for tie-breaking)
+    recall: float = 0.0     # recall for class A
+   
+def tune_lambda_group_risk(
+    cal_df: pd.DataFrame,
+    y_cal: pd.Series,
+    label_A: int = 0,
+    alpha: float = 0.01,
+    lambda_grid: np.ndarray | None = None,
+) -> tuple[float, Dict[float, LambdaResult]]:
+    """
+    Tune lambda so that the per-annotation probability of ever predicting A
+    on a non-A instance is controlled.
+
+    For each annotation g, we define a boolean event:
+        risky_A_per_ann[g] = 1  iff  ∃ i in g : y_pred_i = A and y_i != A
+
+    We then build an upper confidence bound on the fraction of risky annotations
+    using the simple pseudo-count rule
+        risk_ucb = (sum_g risky_A_per_ann[g] + B) / (G + 1),  B = 1
+
+    and choose the smallest lambda whose UCB is <= alpha.
+    """
+    if lambda_grid is None:
+        lambda_grid = np.linspace(0.0, 1.0, 5000)
+    lambda_grid = np.asarray(lambda_grid, dtype=float)
+
+    # 1) Precompute logits (N, K) and labels (N,)
+    class_order = ["A", "B", "C", "D", "E", "F"]
+    logits_list = cal_df["choices_logits"].apply(
+        lambda d: [d[c] for c in class_order]
+    )
+    logits = np.asarray(logits_list.tolist(), dtype=float)       # (N, K)
+    logits += np.abs(logits.min(axis=1, keepdims=True))          # shift non-negative
+
+    y_cal_int = y_cal.to_numpy(dtype=int)                        # (N,)
+    n_cal, K = logits.shape
+
+    # 2) Group membership by annotation_id
+    ann_ids, ann_inverse = np.unique(
+        cal_df["annotation_id"].to_numpy(), return_inverse=True
+    )
+    G = len(ann_ids)                                             # #annotations
+    group_masks = [(ann_inverse == g) for g in range(G)]
+
+    # # 3) Convert logits to probabilities (temperature 6 as before)
+    # probs = torch.softmax(torch.tensor(logits) / 6.0, dim=1).numpy()
+
+    results: Dict[float, LambdaResult] = {}
+
+    for lam in lambda_grid:
+        # 4) Apply per-lambda penalty only to A (column 0)
+        lamb_dot = np.ones_like(logits)
+        lamb_dot[:, label_A] = 1.0 - lam
+        penalized = logits * lamb_dot                              # (N, K)
+      
+        # 5) Point predictions
+        y_pred = np.argmax(penalized, axis=1)                     # (N,)
+
+        # 6) Per-annotation risky event
+        risky_A_per_ann = np.zeros(G, dtype=bool)
+        for g, mask in enumerate(group_masks):
+            if not mask.any():
+                # Should not happen, but be robust
+                continue
+            yp_g = y_pred[mask]
+            yt_g = y_cal_int[mask]
+            # risky_A_per_ann[g] = np.any((yp_g == label_A) & (yt_g != label_A))
+            # risky_A_per_ann[g] = np.sum((yp_g == label_A) & (yt_g != label_A))/ max(np.sum(yt_g != label_A),1)  # avoid divide by zero
+            # risky_A_per_ann[g] = np.sum((yp_g == label_A) & (yt_g == label_A))/ max(np.sum(yt_g == label_A),1)
+            # risky_A_per_ann[g] = np.sum((yp_g == label_A) & (yt_g == label_A))/ max(np.sum(yp_g == label_A),1)
+
+        risk_hat = risky_A_per_ann.mean()
+
+        #  # 6) Global mean FPR for "A": P( predict A | true != A )
+        # is_false_A = (y_pred == label_A) & (y_cal_int != label_A)
+        # denom = np.sum(y_cal_int != label_A)
+        # risk_hat = float(is_false_A.sum() / max(denom, 1))
+
+        
+        
+        # 7) Accuracy over samples (for reference / tie-breaking)
+        acc = float((y_pred == y_cal_int).mean())
+        recall_A = float(((y_pred == label_A) & (y_cal_int == label_A)).sum() / max(np.sum(y_cal_int == label_A),1))
+
+        # 8) Simple UCB with pseudo-count B = 1
+        B = 1.0
+
+        results[float(lam)] = LambdaResult(
+            lam=float(lam),
+            risk_hat=risk_hat,
+            acc=acc,
+            recall = recall_A
+        )
+
+    # 9) Feasible lambdas with UCB <= alpha
+    # feasible = [res for res in results.values() if res.risk_ucb <= alpha]
+    feasible = [res for res in results.values() if res.risk_hat <= (alpha*(G+1) - B)/G]
+    if not feasible:
+        print(
+            "No lambda in lambda_grid satisfies the risk constraint "
+            f"(UCB <= alpha). Best candidate had UCB="
+            f"{min(results.values(), key=lambda r: r.risk_hat).risk_hat:.4f}"
+        )
+        return 1.0, results
+
+    # Smallest feasible lambda
+    best = min(feasible, key=lambda r: r.lam)
+
+    print( max(feasible, key=lambda r: (r.recall, -r.lam)))
+
+    return best.lam, results
+

@@ -22,6 +22,8 @@ from torch.nn.utils.rnn import pad_sequence
 from utils import log_prompt
 from .data_utils.dom_utils import get_tree_repr, prune_tree
 
+choice2token_id = {'A': 71, 'B': 272, 'C': 205, 'D': 309, 'E': 262, 'F': 377}
+
 
 def _parse_operation(operation_field):
     """Safely parse operation field which can be dict, JSON string, or plain string.
@@ -248,6 +250,10 @@ class MultiChoiceDataset(Dataset):
 
     def __len__(self):
         return len(self.data)
+    
+    def action_uids(self):
+        """Return a list of all action_uid values in the dataset."""
+        return [sample.get("action_uid") for sample in self.data]
     
     def _cache_key(self, idx, sample=None):
         """Stable cache key shared across instances."""
