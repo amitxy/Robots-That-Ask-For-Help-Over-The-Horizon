@@ -50,7 +50,7 @@ def compute_mind2web_metrics(
         raise ValueError("No rows left after filtering; cannot compute metrics.")
 
     # Gold element/action from label_text
-    gold_elem_action = data["label_text"].apply(_postprocess_action)
+    gold_elem_action = data["target_text"].apply(_postprocess_action)
     gold_labels = gold_elem_action.apply(lambda x: x[0])
     gold_actions = gold_elem_action.apply(lambda x: x[1])
 
