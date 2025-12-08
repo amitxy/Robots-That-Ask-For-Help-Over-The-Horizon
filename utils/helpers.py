@@ -239,7 +239,7 @@ def tune_lambda_group_risk(
         lambda d: [d[c] for c in class_order]
     )
     logits = np.asarray(logits_list.tolist(), dtype=float)       # (N, K)
-    logits += np.abs(logits.min(axis=1, keepdims=True))          # shift non-negative
+    # logits += np.abs(logits.min(axis=1, keepdims=True))          # shift non-negative
 
     y_cal_int = y_cal.to_numpy(dtype=int)                        # (N,)
     n_cal, K = logits.shape
@@ -259,9 +259,13 @@ def tune_lambda_group_risk(
     for lam in lambda_grid:
         # 4) Apply per-lambda penalty only to A (column 0)
         lamb_dot = np.ones_like(logits)
-        lamb_dot[:, label_A] = 1.0 - lam
-        penalized = logits * lamb_dot                              # (N, K)
-      
+        # lamb_dot[:, label_A] = 1.0 - lam
+        
+        # penalized = logits * lamb_dot  
+        penalized = logits.copy()                            # (N, K)
+        penalized[:, label_A] = logits[:, label_A] - np.abs(logits[:, label_A]) * lam
+        # penalized[:, label_A] = logits[:, label_A] - lam
+        
         # 5) Point predictions
         y_pred = np.argmax(penalized, axis=1)                     # (N,)
 
