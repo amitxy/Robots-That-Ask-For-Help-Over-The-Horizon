@@ -109,6 +109,7 @@ def add_eval_columns(df: pd.DataFrame, threshold: float = None, logits_temp: flo
     """
     df = df.copy()
 
+    df['step_idx'] = df.groupby('annotation_id').cumcount()
     df["choices_probs"] = df["choices_logits"].apply(lambda x: _logits_to_probs(x, logits_temp=logits_temp))
 
     for col, suffix in (("target_text", "target"), ("output_text","pred")):
@@ -123,7 +124,7 @@ def add_eval_columns(df: pd.DataFrame, threshold: float = None, logits_temp: flo
 
 
     if threshold is not None:
-        df["pred_set"] = df['choices_probs'].apply(lambda row: [ label for label, prob in row.items() if 1 - prob <= threshold])
+        df["pred_set"] = df['choices_probs'].apply(lambda row: [ label for label, prob in row.items() if 1 - prob < threshold])
         df["pred_set_size"] = df["pred_set"].apply(len)
 
     if to_save and save_path:
@@ -215,6 +216,7 @@ def tune_lambda_group_risk(
     label_A: int = 0,
     alpha: float = 0.01,
     lambda_grid: np.ndarray | None = None,
+    shrinkage_type: str = 'linear'
 ) -> tuple[float, Dict[float, LambdaResult]]:
     """
     Tune lambda so that the per-annotation probability of ever predicting A
@@ -231,6 +233,7 @@ def tune_lambda_group_risk(
     """
     if lambda_grid is None:
         lambda_grid = np.linspace(0.0, 1.0, 5000)
+
     lambda_grid = np.asarray(lambda_grid, dtype=float)
 
     # 1) Precompute logits (N, K) and labels (N,)
@@ -239,8 +242,6 @@ def tune_lambda_group_risk(
         lambda d: [d[c] for c in class_order]
     )
     logits = np.asarray(logits_list.tolist(), dtype=float)       # (N, K)
-    # logits += np.abs(logits.min(axis=1, keepdims=True))          # shift non-negative
-
     y_cal_int = y_cal.to_numpy(dtype=int)                        # (N,)
     n_cal, K = logits.shape
 
@@ -262,30 +263,32 @@ def tune_lambda_group_risk(
         # lamb_dot[:, label_A] = 1.0 - lam
         
         # penalized = logits * lamb_dot  
-        penalized = logits.copy()                            # (N, K)
-        penalized[:, label_A] = logits[:, label_A] - np.abs(logits[:, label_A]) * lam
-        # penalized[:, label_A] = logits[:, label_A] - lam
+        penalized = logits.copy()
+        if shrinkage_type == 'linear':                      # (N, K)
+            penalized[:, label_A] = logits[:, label_A] - np.abs(logits[:, label_A]) * lam
+        else:
+            penalized[:, label_A] = logits[:, label_A] - lam
         
         # 5) Point predictions
         y_pred = np.argmax(penalized, axis=1)                     # (N,)
 
-        # # 6) Per-annotation risky event
-        # risky_A_per_ann = np.zeros(G, dtype=bool)
-        # for g, mask in enumerate(group_masks):
-        #     if not mask.any():
-        #         # Should not happen, but be robust
-        #         continue
-        #     yp_g = y_pred[mask]
-        #     yt_g = y_cal_int[mask]
-        #     # risky_A_per_ann[g] = np.any((yp_g == label_A) & (yt_g != label_A))
-        #     risky_A_per_ann[g] = np.sum((yp_g == label_A) & (yt_g != label_A))/ max(np.sum(yt_g != label_A),1)
+        # 6) Per-annotation risky event
+        risky_A_per_ann = np.zeros(G, dtype=bool)
+        for g, mask in enumerate(group_masks):
+            if not mask.any():
+                # Should not happen, but be robust
+                continue
+            yp_g = y_pred[mask]
+            yt_g = y_cal_int[mask]
+            # risky_A_per_ann[g] = np.any((yp_g == label_A) & (yt_g != label_A))
+            risky_A_per_ann[g] = np.sum((yp_g == label_A) & (yt_g != label_A))/ max(np.sum(yt_g != label_A),1)
 
-        # risk_hat = risky_A_per_ann.mean()
+        risk_hat = risky_A_per_ann.mean()
 
          # 6) Global mean FPR for "A": P( predict A | true != A )
-        is_false_A = (y_pred == label_A) & (y_cal_int != label_A)
-        denom = np.sum(y_cal_int != label_A)
-        risk_hat = float(is_false_A.sum() / max(denom, 1))
+        # is_false_A = (y_pred == label_A) & (y_cal_int != label_A)
+        # denom = np.sum(y_cal_int != label_A)
+        # risk_hat = float(is_false_A.sum() / max(denom, 1))
 
         
         
@@ -325,6 +328,7 @@ def best_lambda_from_df(
     alpha: float = 0.1,
     lambda_grid: np.ndarray | None = None,
     label_map: dict | None = None,
+    shrinkage_type: str = 'linear'
 ) -> tuple[float, dict]:
     """
     Filter df to calibration actions and compute best lambda (lambda_hat)
@@ -348,5 +352,6 @@ def best_lambda_from_df(
         y_cal=y_cal,
         alpha=alpha,
         lambda_grid=lambda_grid,
+        shrinkage_type=shrinkage_type
     )
     return best_lambda, results
