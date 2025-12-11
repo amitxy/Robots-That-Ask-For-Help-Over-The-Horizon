@@ -120,6 +120,17 @@ def coverage_vs_set_size(df, alpha_line: float = 0.9, method_col: str = 'method'
         .reset_index()
         .rename(columns={"covered": "coverage"})
     )
+    # aggregate over seeds and fill missing method/set_size combos with 0 coverage
+    if hue:
+        methods = df[method_col].unique()
+        sizes = np.sort(df["pred_set_size"].unique())
+        idx = pd.MultiIndex.from_product([methods, sizes], names=[method_col, "pred_set_size"])
+        agg = (
+            agg.groupby([method_col, "pred_set_size"], observed=True)["coverage"]
+               .mean()
+               .reindex(idx, fill_value=0)
+               .reset_index()
+        )
 
     # Left: coverage vs set size; Right: pred set size distribution
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
@@ -176,14 +187,6 @@ def ask_rate_vs_target_prob(df):
     plt.tight_layout()
 
 
-
-def fpr_vs_lambda(metrics_df):
-    plt.figure(figsize=(5,4))
-    plt.plot(metrics_df["lambda"], metrics_df["fp_rate"], marker="o", color="red")
-    plt.xlabel("lambda")
-    plt.ylabel("FP rate")
-    plt.title("False-positive rate vs lambda")
-    plt.tight_layout()
 
 ###############
 
@@ -427,7 +430,7 @@ def risk_plot(
     df["emp_risk"] = df[fp_col]
 
     sns.lineplot(
-        data=df.sort_values(["target_risk", method_col]),
+        data=df.sort_values(["target_risk", 'fp_rate_per_task']),
         x="target_risk",
         y="emp_risk",
         hue=method_col if method_col in df.columns else None,
@@ -441,6 +444,7 @@ def risk_plot(
     plt.title("Empirical Risk vs Target Risk")
     plt.legend()
     plt.tight_layout()
+    plt.grid(alpha=0.3)
     plt.show()
 
 
@@ -462,7 +466,7 @@ def risk_vs_pred_size(
    
     # plt.xlim(0, df[risk_col].max() * 1.05)
     # plt.ylim(0, df[target_col].max() * 1.05)
-    plt.xlabel("Empirical risk (α)")
+    plt.set_xlabel(r"Empirical risk $(\hat{R})$")
     plt.ylabel("Avg prediction set size")
     plt.title("Avg prediction set size vs Empirical Risk")
     plt.legend()
@@ -487,6 +491,7 @@ def risk_and_size_plots(
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 6))
 
+  
     # Left: risk vs set size
     sns.lineplot(
         data=df.sort_values([emp_risk_col, method_col]),
@@ -498,9 +503,10 @@ def risk_and_size_plots(
         legend=False,
     )
     
-    axes[0].set_xlabel("Empirical risk (α)")
+    axes[0].set_xlabel(r"Empirical risk $(\hat{R})$")
     axes[0].set_ylabel("Avg prediction set size")
     axes[0].set_title("Pred set size vs Empirical Risk")
+    axes[0].grid(alpha=0.3)
 
     # Right: risk vs set size
     sns.lineplot(
@@ -510,7 +516,7 @@ def risk_and_size_plots(
         hue=method_col if method_col in df.columns else None,
         marker="o",
     )
-    axes[1].set_xlabel("Empirical risk (α)")
+    axes[1].set_xlabel(r"Empirical risk $(\hat{R})$")
     axes[1].set_ylabel("Ask probability")
     axes[1].set_title("Ask prob vs Empirical Risk")
 
@@ -521,7 +527,38 @@ def risk_and_size_plots(
     else:
         axes[0].legend()
 
+    plt.grid(alpha=0.3)
     plt.tight_layout()
+    plt.show()
+
+
+
+def fpr_a_vs_coverage(metrics_df: pd.DataFrame, method_col: str = "method", risk_col: str = "fp_rate_per_task",  fp_col="fp_rate"):
+    """
+    Scatter/line plot of FPR for class A (pred=A | true!=A) vs overall empirical coverage.
+    Computes per (method, seed) then plots one curve per method.
+    """
+    
+    df = metrics_df.copy()
+    
+    sns.lineplot(
+        data=df.sort_values(["target_in_pred_set", fp_col]),
+        x=fp_col,
+        y="target_in_pred_set",
+        hue=method_col if method_col in df.columns else None,
+        marker="o",
+    )
+    
+    # plt.xlim(0, df["target_risk"].max() * 1.05)
+    # plt.ylim(0, df["emp_risk"].max() * 1.05)
+    max_x = df[risk_col].max()
+    # plt.plot([0, max_x + 0.05], [0, 1], "k--", label="y = x")
+    plt.xlabel("Empirical coverage (Pr(target in pred_set))")
+    plt.ylabel(r"FPR for A ($Pr(\hat{Y}=A | Y\neq A)$)")
+    plt.title("FPR for class A vs coverage")
+    plt.legend()
+    plt.tight_layout()
+    plt.grid(alpha=0.3)
     plt.show()
 
 
