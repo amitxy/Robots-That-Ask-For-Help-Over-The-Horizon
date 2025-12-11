@@ -256,6 +256,7 @@ def tune_lambda_group_risk(
     # probs = torch.softmax(torch.tensor(logits) / 6.0, dim=1).numpy()
 
     results: Dict[float, LambdaResult] = {}
+    results_cov: Dict[float, LambdaResult] = {}
 
     for lam in lambda_grid:
         # 4) Apply per-lambda penalty only to A (column 0)
@@ -266,14 +267,17 @@ def tune_lambda_group_risk(
         penalized = logits.copy()
         if shrinkage_type == 'linear':                      # (N, K)
             penalized[:, label_A] = logits[:, label_A] - np.abs(logits[:, label_A]) * lam
-        else:
-            penalized[:, label_A] = logits[:, label_A] - lam
         
+        elif shrinkage_type == 'constatnt':
+            penalized[:, label_A] = logits[:, label_A] - lam
+
+            
         # 5) Point predictions
         y_pred = np.argmax(penalized, axis=1)                     # (N,)
 
         # 6) Per-annotation risky event
         risky_A_per_ann = np.zeros(G, dtype=bool)
+        # risky_coverage = np.zeros(G, dtype=bool)
         for g, mask in enumerate(group_masks):
             if not mask.any():
                 # Should not happen, but be robust
@@ -281,9 +285,33 @@ def tune_lambda_group_risk(
             yp_g = y_pred[mask]
             yt_g = y_cal_int[mask]
             # risky_A_per_ann[g] = np.any((yp_g == label_A) & (yt_g != label_A))
-            risky_A_per_ann[g] = np.sum((yp_g == label_A) & (yt_g != label_A))/ max(np.sum(yt_g != label_A),1)
+            
+            if shrinkage_type != 'CRC':
+                risky_A_per_ann[g] = np.sum((yp_g == label_A) & (yt_g != label_A))/ max(np.sum(yt_g != label_A),1)
+
+            else:
+                a_logits = penalized[mask, label_A]          # (n_actions_in_ann,)
+                a_in_set = a_logits > lam                      # bool mask
+                neg_mask = yt_g != label_A                                  # bool mask for negatives
+                fp = (a_in_set & neg_mask).sum()
+                denom = max(neg_mask.sum(), 1)
+                risky_A_per_ann[g] = fp / denom
+
+
+
+
+            # action_idx_with_min_prob = np.argmin(penalized[mask, yt_g]) # The index of the action that contains the smallest true prob in the annotation
+            # min_prob_idx = np.where(mask)[0][action_idx_with_min_prob]
+            # row = penalized_probs[min_prob_idx]             #  penalized_probs: shape [N_actions, n_classes]
+            # pred_set = np.flatnonzero(1 - row < 1- 1/(1 + lam))       # indices of labels above threshold
+            # y_min_t = row.argmin()                            # label with smallest prob on that row
+            # risky_coverage[g] = y_min_t not in pred_set
+          
+     
+            
 
         risk_hat = risky_A_per_ann.mean()
+        # risk_cov_hat = risky_coverage.mean()
 
          # 6) Global mean FPR for "A": P( predict A | true != A )
         # is_false_A = (y_pred == label_A) & (y_cal_int != label_A)
@@ -306,9 +334,30 @@ def tune_lambda_group_risk(
             recall = recall_A
         )
 
+        # results_cov[float(lam)] = LambdaResult(
+        #     lam=float(lam),
+        #     risk_hat=risk_cov_hat,
+        #     acc=acc,
+        #     recall = recall_A
+        # )
+
     # 9) Feasible lambdas with UCB <= alpha
     # feasible = [res for res in results.values() if res.risk_ucb <= alpha]
     feasible = [res for res in results.values() if res.risk_hat <= (alpha*(G+1) - B)/G]
+
+    # # feasible_cov = [res for res in results_cov.values() if res.risk_hat <= (0.2*(G+1) - B)/G]
+
+    # if feasible and feasible_cov:
+    #     best_cov = min(feasible_cov, key=lambda r: r.lam)
+    #     best = min(feasible, key=lambda r: r.lam)
+    #     print(
+    #         f"cov_lambda={best_cov.lam:.4f} (cov_risk={best_cov.risk_hat:.4f})"
+    #         f"FPR lambda={best.lam:.4f} (FPR_risk={best.risk_hat:.4f})"
+    #     )
+    #     return max(best.lam, best_cov.lam), results
+    # else:
+    #     feasible = None
+
     if not feasible:
         print(
             "No lambda in lambda_grid satisfies the risk constraint "
