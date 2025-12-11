@@ -289,9 +289,6 @@ def a_in_pred_set(df, method_col: str = "method", iter_col: str = "seed"):
     plt.show()
 
 
-
-
-
 def failure_rate_vs_step_length(df, ann_col: str = "annotation_id", correct_col: str = "correct"):
     """
     Plot failure rate versus step index (within an annotation), stratified by pred_set_size.
@@ -299,22 +296,73 @@ def failure_rate_vs_step_length(df, ann_col: str = "annotation_id", correct_col:
     """
 
     df = df.copy()
-    if "step_id" not in df.columns:
-        df["step_id"] = df.groupby(ann_col).cumcount()
+    
     df["fail"] = ~df[correct_col].astype(bool)
     agg = (
-        df.groupby(["step_id", "pred_set_size"])["fail"]
+        df.groupby(["step_idx", "pred_set_size"])["fail"]
         .mean()
         .reset_index()
         .rename(columns={"fail": "failure_rate"})
     )
-    plt.figure(figsize=(6, 4))
-    sns.lineplot(data=agg, x="step_id", y="failure_rate", hue="pred_set_size", marker="o")
+   
+    sns.lineplot(data=agg, x="step_idx", y="failure_rate", hue="pred_set_size", marker="o")
     plt.xlabel("Step index")
     plt.ylabel("Failure rate")
     plt.title("Failure rate vs step index by pred_set_size")
     plt.ylim(0, 1)
     plt.tight_layout()
+    plt.show()
+
+
+def set_size_vs_task_length(df, ann_col: str = "annotation_id", method_col: str = "method", alpha: float = 0.9):
+    """
+    Plot average pred_set_size versus step index (within an annotation), optionally split by method.
+    Right panel shows conditional coverage versus step index.
+    """
+
+    df = df.copy()
+    group_cols = ["step_idx"]
+    hue = None
+    if method_col and method_col in df.columns:
+        group_cols.insert(0, method_col)
+        hue = method_col
+
+    agg_size = (
+        df.groupby(group_cols, observed=True)["pred_set_size"]
+        .mean()
+        .reset_index()
+        .rename(columns={"pred_set_size": "avg_pred_set_size"})
+    )
+    agg_cov = (
+        df.groupby(group_cols, observed=True)["covered"]
+        .mean()
+        .reset_index()
+        .rename(columns={"covered": "coverage"})
+    )
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+
+    sns.lineplot(data=agg_size, x="step_idx", y="avg_pred_set_size", hue=hue, marker="o", ax=axes[0])
+    axes[0].set_xlabel("Step index")
+    axes[0].set_ylabel("Average pred set size")
+    axes[0].set_title("Avg pred set size vs step index")
+
+    sns.lineplot(data=agg_cov, x="step_idx", y="coverage", hue=hue, marker="o", ax=axes[1], legend=True)
+    axes[1].set_xlabel("Step index")
+    axes[1].set_ylabel("Avg Coverage")
+    axes[1].set_ylim(agg_cov["coverage"].min()-0.05, 1.05)
+    axes[1].set_title("Coverage vs step index" )
+    axes[1].axhline(alpha, linestyle="--", color="gray", alpha=0.7, label=f"Target coverage ({alpha})")
+
+    if hue:
+        handles, labels = axes[0].get_legend_handles_labels()
+        axes[0].legend(handles, labels, title=hue)
+        handles, labels = axes[1].get_legend_handles_labels()
+        axes[1].legend(handles, labels, title=hue)
+
+    plt.tight_layout()
+    plt.show()
+
 
 def coverage_boxplot(df_all, iter_col: str = "seed", method_col: str = "method", alpha: float = 0.9):
     """
@@ -366,3 +414,152 @@ def coverage_boxplot(df_all, iter_col: str = "seed", method_col: str = "method",
 
     plt.tight_layout()
     plt.show()
+
+
+def risk_plot(
+    metrics_df: pd.DataFrame,
+    risk_col="risk_level",   # target risk α
+    fp_col="fp_rate_per_task",     # empirical risk: FP per task
+    method_col="method",           # optional
+):
+    df = metrics_df.copy()
+    df["target_risk"] = df[risk_col]
+    df["emp_risk"] = df[fp_col]
+
+    sns.lineplot(
+        data=df.sort_values(["target_risk", method_col]),
+        x="target_risk",
+        y="emp_risk",
+        hue=method_col if method_col in df.columns else None,
+        marker="o",
+    )
+    plt.plot([0, 1], [0, 1], "k--", label="y = x")
+    # plt.xlim(0, df["target_risk"].max() * 1.05)
+    # plt.ylim(0, df["emp_risk"].max() * 1.05)
+    plt.xlabel("Target risk (α)")
+    plt.ylabel("Empirical risk (FPR per task)")
+    plt.title("Empirical Risk vs Target Risk")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def risk_vs_pred_size(
+    metrics_df: pd.DataFrame,
+    risk_col="fp_rate_per_task",   # target risk α
+    target_col="pred_set_avg",   
+    method_col="method",           # optional
+):
+    df = metrics_df.copy()
+    
+    sns.lineplot(
+        data=df.sort_values([risk_col, method_col]),
+        x=risk_col,
+        y=target_col,
+        hue=method_col if method_col in df.columns else None,
+        marker="o",
+    )
+   
+    # plt.xlim(0, df[risk_col].max() * 1.05)
+    # plt.ylim(0, df[target_col].max() * 1.05)
+    plt.xlabel("Empirical risk (α)")
+    plt.ylabel("Avg prediction set size")
+    plt.title("Avg prediction set size vs Empirical Risk")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def risk_and_size_plots(
+    metrics_df: pd.DataFrame,
+    target_risk_col: str = "risk_level",
+    emp_risk_col: str = "fp_rate_per_task",
+    size_col: str = "pred_set_avg",
+    method_col: str = "method",
+):
+    """
+    Two-panel plot:
+      - Left: target risk vs empirical risk (should lie on/below y=x)
+      - Right: empirical risk vs average prediction set size
+    """
+    df = metrics_df.copy()
+    hue = method_col if method_col in df.columns else None
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+
+    # Left: risk vs set size
+    sns.lineplot(
+        data=df.sort_values([emp_risk_col, method_col]),
+        x=emp_risk_col,
+        y=size_col,
+        hue=hue,
+        marker="o",
+        ax=axes[0],
+        legend=False,
+    )
+    
+    axes[0].set_xlabel("Empirical risk (α)")
+    axes[0].set_ylabel("Avg prediction set size")
+    axes[0].set_title("Pred set size vs Empirical Risk")
+
+    # Right: risk vs set size
+    sns.lineplot(
+        data=df.sort_values([emp_risk_col, method_col]),
+        x=emp_risk_col,
+        y='ask_prob',
+        hue=method_col if method_col in df.columns else None,
+        marker="o",
+    )
+    axes[1].set_xlabel("Empirical risk (α)")
+    axes[1].set_ylabel("Ask probability")
+    axes[1].set_title("Ask prob vs Empirical Risk")
+
+    if hue:
+        handles, labels = axes[1].get_legend_handles_labels()
+        axes[0].legend(handles, labels, title=method_col)
+        axes[1].legend(title=method_col)
+    else:
+        axes[0].legend()
+
+    plt.tight_layout()
+    plt.show()
+
+
+def conditional_risk_by_step(
+    df: pd.DataFrame,
+    step_col: str = "step_idx",
+    method_col: str = "method",
+    pred_col: str = "pred_label",
+    true_col: str = "target_label",
+    pos_label: str = "A",
+    target_alpha: float | None = None,
+):
+    """
+    Bar plot of empirical risk (FPR for pos_label) by difficulty group (step index).
+    If method_col is present, produces grouped bars per method.
+    """
+    df = df.copy()
+    df["fp"] = (df[pred_col] == pos_label) & (df[true_col] != pos_label)
+    df["neg"] = df[true_col] != pos_label
+
+    group_cols = [step_col]
+    if method_col and method_col in df.columns:
+        group_cols.insert(0, method_col)
+
+    agg = (
+        df.groupby(group_cols, observed=True)
+        .apply(lambda x: x["fp"].sum() / x["neg"].sum() if x["neg"].sum() > 0 else np.nan)
+        .reset_index(name="risk")
+    )
+
+    plt.figure(figsize=(6, 4))
+    sns.barplot(data=agg, x=step_col, y="risk", hue=method_col if method_col in agg.columns else None, palette="tab10")
+    if target_alpha is not None:
+        plt.axhline(target_alpha, linestyle="--", color="gray", alpha=0.7, label=f"alpha={target_alpha}")
+    plt.ylabel(f"Empirical risk (P(pred={pos_label} | true≠{pos_label}))")
+    plt.xlabel("Step index / difficulty group")
+    plt.title("Conditional risk by difficulty group")
+    plt.tight_layout()
+    plt.show()
+
+ 
