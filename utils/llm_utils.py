@@ -45,7 +45,7 @@ def tensorize_item(item: Dict[str, Any], device: str):
     def to_tensor(x):
         if isinstance(x, torch.Tensor):
             return x.to(device)
-        return torch.tensor(x, dtype=torch.long, device=device)
+        return torch.tensor(x, dtype=torch.long, device='cpu')
 
     input_ids = to_tensor(item["input_ids"])
     attention_mask = to_tensor(item["attention_mask"])
@@ -77,20 +77,20 @@ def choices_probabilities(logits, pred_set:list=None, temperature=1) -> dict:
     if temperature < 0:
             raise ValueError("Temperature must be non-negative")
     
-    choices = MultiChoiceDataset.choice2token_id
+    choices = choice2token_id
     
     if pred_set:
         # remap to filtered choices (A,B,...)
-        mapping = {lab:chr(65 +i) for i, lab in enumerate(pred_set)}
-        choices = {lab:choices[mapping[lab]] for lab in pred_set }
-        # choices = {lab:choices_to_token_ids[lab] for lab in pred_set }
+        # mapping = {lab:chr(65 +i) for i, lab in enumerate(pred_set)}
+        # choices = {lab:choices[mapping[lab]] for lab in pred_set }
+        choices = {lab:choice2token_id[lab] for lab in pred_set }
         
     # else:
     #     mapping = dict(zip(choice2token_id.keys(), choice2token_id.keys()))
 
     choices_idx = torch.tensor(list(choices.values()), device='cpu', dtype=torch.long)
     
-    probs = F.softmax(logits[choices_idx] / temperature, dim=-1)
+    probs = F.softmax(logits[:,choices_idx] / temperature, dim=-1)[0]
     #F.softmax(logits, dim=-1)[:, choices_idx][0]
 
     choices_probs = dict(zip(choices.keys(), probs.cpu().tolist()))
@@ -373,19 +373,21 @@ def filter_choices(choices_str: str, pred_set: list[str]):
       another label will be mapped to 'A'"""
     mask = list(ord(label) - 65 for label in pred_set)
     choices_strs = choices_str.splitlines()
-    # filtered_choices_str = '\n'.join(chr(65 + i) + choices_strs[i][1:] for i in mask)
-    filtered_choices_str = '\n'.join(chr(65 + shift) + choices_strs[i][1:] for shift, i in enumerate(mask))
+    filtered_choices_str = '\n'.join(chr(65 + i) + choices_strs[i][1:] for i in mask)
+    # filtered_choices_str = '\n'.join(chr(65 + shift) + choices_strs[i][1:] for shift, i in enumerate(mask))
     
     return filtered_choices_str
 
 
-def re_evaluate_with_oracle(test_dict:pd.DataFrame, df:pd.DataFrame, answer_df:pd.DataFrame,model, tokenizer, device='cuda') -> pd.DataFrame:
+def re_evaluate_with_oracle(test_dict:Dict[str, MultiChoiceDataset], df:pd.DataFrame, answer_df:pd.DataFrame,model, tokenizer, shrinkage=0, device='cuda') -> pd.DataFrame:
     prompt_template = Template(re_eval_prompt_template)
     idx_split_map = {i:split_name for i, split_name in enumerate(test_dict.keys())}
     # Align answers to the filtered df order
     answers = answer_df.reindex(df.index)['oracle_answer'].values
     outputs = []
 
+    num_improved = 0
+    num_worse = 0
     new_correct = 0
     for pos, (_, row) in enumerate(tqdm(df.iterrows(), desc="Re-evaluating with oracle...", total=len(df))):
         relative_idx = row['relative_idx']
@@ -399,7 +401,6 @@ def re_evaluate_with_oracle(test_dict:pd.DataFrame, df:pd.DataFrame, answer_df:p
                                                   choices=filtered_choices_str,
                                                 #   choices = choices_str,
                                                   help=answers[pos])
-                
         seq_context = tokenizer(html_context,truncation=True,max_length=512,add_special_tokens=False,)
         seq_in = tokenizer(prompt,add_special_tokens=True,truncation=True,max_length=512)
         model_input = {
@@ -407,32 +408,38 @@ def re_evaluate_with_oracle(test_dict:pd.DataFrame, df:pd.DataFrame, answer_df:p
                     "attention_mask": seq_context["attention_mask"] + seq_in["attention_mask"],
                 }
         model_input = tensorize_item(model_input, device=device)
+        processors = LogitsProcessorList([ShrinkageTokenProcessor([choice2token_id['A']], shrinkage=shrinkage)])
         with torch.inference_mode():
                     out = model.generate(
                         **model_input,
                         eos_token_id=model.config.eos_token_id,
                         max_new_tokens=25,
                         return_dict_in_generate=True,
-                        output_scores=True
+                        output_scores=True,
+                        logits_processor=processors,
                     )
         decoded = tokenizer.decode(out["sequences"][0], skip_special_tokens=True)
-       
         choices_probs = choices_probabilities(out["scores"][0], pred_set=row['pred_set'])
         pred_label, pred_action, pred_value = parse_output(decoded)
         # print(f"Choices probs (full): {choices_probs0}")
         # print(f"Choices probs (filtered): {choices_probs}")
-        # if pos > 0:
-        #     print(html_context)
-        #     print(prompt)
-        #     print(f"Decoded: {decoded}, pred: {pred_label}, label: {row['label']}, Original pred: {row['pred_label']}")
+        # if pos >= 0:
+        #     # print(html_context)
+        #     # print(prompt)
+        #     print(f"Decoded: {decoded}, pred: {pred_label}, label: {row['target_label']}, Original pred: {row['pred_label']}")
         #     print(f'pred set: {row["pred_set"]}, choices_probs: {choices_probs}')
         #     print(f"-------------------------")
         #     print(row['choices_probs'])
         #     return
-        # new_correct += int(pred_label == row['label'])
-        # if pos % 100 == 0:
-        #     tqdm.write(f"{new_correct}/{pos+1}({new_correct/(pos+1):.2f})")
-        
+
+
+        correct = int(pred_label == row['target_label'])
+        new_correct += correct
+        num_improved += correct and (row['pred_label'] != row['target_label'])
+        num_worse += (not correct) and (row['pred_label'] == row['target_label'])
+
+        if pos % 100 == 0:
+            tqdm.write(f"{new_correct}/{pos+1}({new_correct/(pos+1):.2f})| Improved: {num_improved} | Worse: {num_worse}")
 
         # return
         
@@ -442,8 +449,8 @@ def re_evaluate_with_oracle(test_dict:pd.DataFrame, df:pd.DataFrame, answer_df:p
                     row['annotation_id'],
                     row['action_uid'],
                     pred_label, pred_action, pred_value,
-                    row['label'],
-                    row['label_text'],
+                    row['target_label'],
+                    row['target_text'],
                     choices_probs,
                     choices_probs.get(pred_label, 0),
                     row['test_split'],
@@ -453,7 +460,7 @@ def re_evaluate_with_oracle(test_dict:pd.DataFrame, df:pd.DataFrame, answer_df:p
 
         # Tight memory management
         del out
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
         gc.collect()
     
         # log_response(row['annotation_id'], row['action_uid'], decoded)
@@ -619,36 +626,24 @@ def re_evaluate_with_oracle_batch(
 
 class ShrinkageTokenProcessor(LogitsProcessor):
     def __init__(self, token_ids, shrinkage=0, device=None):
-        if shrinkage < 0 or shrinkage > 1:
-            raise ValueError("Shrinkage penalty must be between 0 and 1")
-        
         self.shrinkage = shrinkage # Shrinkage penalty
         ids = sorted(set(token_ids)) # Makes sure that shrinkage applied only once
         self.shrink_ids = torch.tensor(ids, dtype=torch.long, device=device)
 
         # Indicator for making sure that shrinkage is applied only on the first token generation
-        self._applied = False 
+        self.is_first_token = True
 
     def __call__(self, input_ids, scores):
-        if self._applied:
+        if not self.is_first_token:
             return scores
         
-        # # Softmax is shift-invariant
-        # min_abs_score = scores.min(dim=1, keepdim=True).values.abs()
-        # scores += min_abs_score
-
-        # replace inf/NaN with a large negative sentinel
-        finite_scores = torch.nan_to_num(scores, neginf=-1e9, posinf=1e9)
-        # per-row offset to make the min ~0
-        offset = (-finite_scores.min(dim=1, keepdim=True).values).clamp(min=0) + 1e-6
-        scores = scores + offset  # softmax is shift-invariant
-
+        
         # min_vals = scores.min(dim=1, keepdim=True).values
         # scores = scores - min_vals + 1e-6
         
-        scores[:, self.shrink_ids] *=  (1.0 - self.shrinkage)
+        scores[:, self.shrink_ids] -= self.shrinkage
         # scores[:, self.shrink_ids] = scores[:, self.shrink_ids] * (1.0 - self.shrinkage)
-        self._applied = True
+        self.is_first_token = False
         return scores
 
 

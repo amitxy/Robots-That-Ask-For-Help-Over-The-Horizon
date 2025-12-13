@@ -188,8 +188,6 @@ class PromptView:
         return self._parent._get_prompt_element(idx)
 
 
-
-
 class MultiChoiceDataset(Dataset):
     """
     Mind2Web multi-choice dataset wrapper.
@@ -245,8 +243,8 @@ class MultiChoiceDataset(Dataset):
         self.prompt_view = PromptView(self)
 
         # Generate choice2token_id once
-        if not MultiChoiceDataset.choice2token_id and self.tokenizer is not None:
-            MultiChoiceDataset.choice2token_id = choice2token_id_mapping(self.tokenizer, self.num_candidates)
+        # if not MultiChoiceDataset.choice2token_id and self.tokenizer is not None:
+            # MultiChoiceDataset.choice2token_id = choice2token_id_mapping(self.tokenizer, self.num_candidates)
 
     def __len__(self):
         return len(self.data)
@@ -573,7 +571,7 @@ def get_data_split(data_dir, split_file, candidate_results=None, is_train=False,
 
 
 def subsample_by_annotation(
-    dataset,
+    dataset: Dataset,
     num_annotations=None,
     frac=None,
     seed=0,
@@ -658,3 +656,25 @@ def multichoice_collate_fn(batch, device='cuda', token_pad_id=0, label_pad_id=-1
     out["annotation_ids"] = [ex["annotation_id"] for ex in batch]
     out["action_uids"] = [ex["action_uid"] for ex in batch]
     return out
+
+def subsample_df_by_annotation(df: pd.DataFrame, seed: int = 0, frac: float = 0.5):
+    """
+    Split df by unique annotation_id into two DataFrames (df1 [frac] , df2 [1-frac]) deterministically.
+
+    Args:
+        df: DataFrame with an 'annotation_id' column.
+        seed: RNG seed for reproducibility.
+        frac: Fraction of unique annotation_ids to put in the first split.
+
+    Returns:
+        cal_split_df, pen_split_df
+    """
+    ids = df["annotation_id"].dropna().unique()
+    rng = np.random.RandomState(seed)
+    rng.shuffle(ids)
+    cut = int(len(ids) * frac)
+    cal_ids = set(ids[:cut])
+    pen_ids = set(ids[cut:])
+    cal_split = df[df["annotation_id"].isin(cal_ids)].reset_index(drop=True)
+    pen_split = df[df["annotation_id"].isin(pen_ids)].reset_index(drop=True)
+    return cal_split, pen_split

@@ -268,10 +268,14 @@ def tune_lambda_group_risk(
         if shrinkage_type == 'linear':                      # (N, K)
             penalized[:, label_A] = logits[:, label_A] - np.abs(logits[:, label_A]) * lam
         
-        elif shrinkage_type == 'constatnt':
+        elif shrinkage_type == 'constant':
             penalized[:, label_A] = logits[:, label_A] - lam
 
-            
+        elif shrinkage_type == 'CRC':
+            pass
+        else:
+            raise ValueError(f"Unknown shrinkage_type: {shrinkage_type}")
+        
         # 5) Point predictions
         y_pred = np.argmax(penalized, axis=1)                     # (N,)
 
@@ -288,6 +292,7 @@ def tune_lambda_group_risk(
             
             if shrinkage_type != 'CRC':
                 risky_A_per_ann[g] = np.sum((yp_g == label_A) & (yt_g != label_A))/ max(np.sum(yt_g != label_A),1)
+                
 
             else:
                 a_logits = penalized[mask, label_A]          # (n_actions_in_ann,)
@@ -358,17 +363,22 @@ def tune_lambda_group_risk(
     # else:
     #     feasible = None
 
+   
     if not feasible:
+        best_candidate = min(results.values(), key=lambda r: r.risk_hat)
         print(
             "No lambda in lambda_grid satisfies the risk constraint "
-            f"(UCB <= alpha). Best candidate had UCB="
-            f"{min(results.values(), key=lambda r: r.risk_hat).risk_hat:.4f}"
+            f"(UCB <= alpha). Best candidate (lambd={best_candidate.lam:.4f}) had UCB="
+            f"{best_candidate.risk_hat:.4f}>{(alpha*(G+1) - B)/G}"
         )
         return 1.0, results
 
     # Smallest feasible lambda
     best = min(feasible, key=lambda r: r.lam)
-
+    # print(
+    #     f"Chosen lambda={best.lam:.4f} with risk_hat={best.risk_hat:.4f} "
+    #     f"and accuracy={best.acc:.4f}"
+    # )
     return best.lam, results
 
 
