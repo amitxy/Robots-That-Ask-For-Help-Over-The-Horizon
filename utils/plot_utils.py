@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from collections import defaultdict
+from typing import Optional, Sequence, Tuple
 
 axis_labels = defaultdict(lambda: "No text available")
 axis_labels.update(
@@ -151,57 +152,23 @@ def coverage_vs_set_size(df, alpha_line: float = 0.9, method_col: str = 'method'
 
 
 
-
 ########
-def ask_rate_vs_target_prob(df):
-    df = df.copy()
-    bins = [0.0, 0.2, 0.4, 0.7, 0.9, 1.0] 
-    df["ask"] = df["pred_set_size"] > 1
-    df["bin"] = pd.cut(df["target_prob"], bins=4,include_lowest=True,right=True,)
+# def ask_rate_vs_target_prob(df):
+#     df = df.copy()
+#     bins = [0.0, 0.2, 0.4, 0.7, 0.9, 1.0] 
+#     df["ask"] = df["pred_set_size"] > 1
+#     df["bin"] = pd.cut(df["target_prob"], bins=4,include_lowest=True,right=True,)
 
-    ask_rate = df.groupby("bin")["ask"].mean()
+#     ask_rate = df.groupby("bin")["ask"].mean()
 
-    # plt.figure(figsize=(5,4))
+#     # plt.figure(figsize=(5,4))
 
-    ask_rate.plot(marker="o")
-    plt.xticks(rotation=45, ha="right")
-    plt.ylabel("Ask rate")
-    plt.title("Ask probability vs target_prob bin")
-    plt.tight_layout()
+#     ask_rate.plot(marker="o")
+#     plt.xticks(rotation=45, ha="right")
+#     plt.ylabel("Ask rate")
+#     plt.title("Ask probability vs target_prob bin")
+#     plt.tight_layout()
 
-
-
-###############
-
-def a_in_pred_set_bar_plot(df, method_col: str = "method"):
-    """
-    Plot P(A in pred_set) by pred_set_size, optionally split by method.
-    Supports df_all-style inputs with a 'method' column; if absent, plots overall.
-    """
-    df = df.copy()
-    df["A_in_set"] = df["pred_set"].apply(lambda s: "A" in s if isinstance(s, (list, tuple, set)) else False)
-
-    group_cols = ["pred_set_size"]
-    if method_col and method_col in df.columns:
-        # group_cols.insert(0,"seed")
-        group_cols.insert(0, method_col)
-
-    agg = (
-        df.groupby(group_cols, observed=True)["A_in_set"]
-        .mean()
-        .reset_index(name="p_A_in_set")
-    )
-
-    if method_col in agg.columns:
-        sns.barplot(data=agg, x="pred_set_size", y="p_A_in_set", hue=method_col)
-        plt.legend(title="method")
-    else:
-        sns.barplot(data=agg, x="pred_set_size", y="p_A_in_set")
-    plt.ylabel("P(A in pred_set)")
-    plt.xlabel("Pred set size")
-    plt.title("How often 'A' is in the prediction set vs set size")
-    plt.tight_layout()
-    plt.show()
 
 
 
@@ -581,11 +548,6 @@ def quick_plot(metrics_df: pd.DataFrame,x='fp_rate_per_task',y='risk_level', met
     plt.show()
 
 
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from typing import Optional, Sequence, Tuple
-
 
 def plot_episode_reliability_multi(
     df: pd.DataFrame,
@@ -651,21 +613,9 @@ def plot_episode_reliability_multi(
     if seed is not None:
         df_filt = df_filt[df_filt["seed"] == seed]
 
-    if df_filt.empty:
-        raise ValueError("Filtered dataframe is empty; check filters (risk_level, threshold_alpha, seed).")
-
     # Determine which methods to plot
-    all_methods = sorted(df_filt["method"].unique().tolist())
-    if methods is None:
-        methods_to_plot = all_methods
-    else:
-        methods_to_plot = [m for m in methods if m in all_methods]
-        if not methods_to_plot:
-            raise ValueError(
-                f"None of the specified methods {methods} are present after filtering. "
-                f"Available: {all_methods}"
-            )
-
+    methods_to_plot = sorted(df_filt["method"].unique().tolist())
+    
     # Set up bin edges in [0,1]
     bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
 
@@ -740,8 +690,8 @@ def plot_episode_reliability_multi(
 
     ax.set_xlim(0.0, 1.0)
     ax.set_ylim(0.0, 1.0)
-    ax.set_xlabel("Predicted episode confidence")
-    ax.set_ylabel("Empirical episode success frequency")
+    ax.set_xlabel("Predicted task (episode) confidence")
+    ax.set_ylabel("Empirical task (episode) success frequency")
 
     if title is None:
         pieces = ["Episode-level Reliability"]
@@ -753,7 +703,7 @@ def plot_episode_reliability_multi(
             pieces.append(f"seed={seed}")
         title = " | ".join(pieces)
 
-    ax.set_title(title)
+   
     ax.legend(title="method", loc="best")
     fig.tight_layout()
     for e in bin_edges:
