@@ -2,14 +2,16 @@ from mind2web.dataloader import MultiChoiceDataset
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from transformers import AutoModelForImageTextToText, AutoProcessor, AutoTokenizer, LogitsProcessor, LogitsProcessorList
+from transformers import AutoModelForImageTextToText, AutoProcessor, AutoTokenizer, LogitsProcessor, LogitsProcessorList, AutoModelForSeq2SeqLM
 from string import Template
 import pandas as pd
 from tqdm.auto import tqdm
+from abc import ABC, abstractmethod
 
 from utils.prompts import oracle_prompt_template, re_eval_prompt_template, standard_prompt_template
 from PIL import Image
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List, Union
+
 import os
 from google import genai
 import gc
@@ -20,8 +22,8 @@ from utils import log_response
 from utils.helpers import parse_output  # for parse_output
 from mind2web.dataloader import MultiChoiceDataset, multichoice_collate_fn, choice2token_id
 
-
-
+import json, copy
+from pathlib import Path
 
 import logging
 
@@ -34,7 +36,7 @@ handler = logging.FileHandler("prompt_eval.log", mode='w') # 'w' overwrites, 'a'
 formatter = logging.Formatter('%(asctime)s - %(message)s')
 handler.setFormatter(formatter)
 
-
+DEFAULT_CANDIDATES = ['A', 'B', 'C', 'D', 'E', 'F']
 
 
 def tensorize_item(item: Dict[str, Any], device: str):
@@ -367,6 +369,167 @@ class Oracle:
 
 
 
+# This represents: {'pred_text': "[Model Output]", 'choices_logits': {'A': 5.2, 'B': 1.1, ..., 'F': 0.0}}
+PredictionOutput = Dict[str, Union[str, Dict[str, float]]]
+
+class BaseWrapper(ABC):
+    @abstractmethod
+    def generate(
+        self, 
+        prompts: List[str], 
+        images: Optional[List[Image.Image]] = None, 
+        **kwargs
+    ) -> List[PredictionOutput]:
+        """
+        Unified interface. 
+        Returns a list of dicts: {'pred_text': ..., 'choices_logits': ...}
+        """
+        pass
+
+    @property
+    def n_candidates(self) -> int:
+        return self._n_candidates
+
+    @property
+    def choice2token_id(self) -> Dict[str, int]:
+        """Map each choice letter ('A', 'B', ...) to its tokenizer id"""
+        if self._choice2token_id:
+            return self._choice2token_id
+        
+        mapping = {}
+        for i in range(self.n_candidates + 1):
+            cand = chr(65 + i)  # 'A', 'B', ...
+            # Handle standard tokenizer vs processor tokenizer
+            if hasattr(self.tokenizer, "encode"):
+                token_ids = self.tokenizer.encode(cand, add_special_tokens=False)
+            else:
+                token_ids = self.tokenizer(cand, add_special_tokens=False)["input_ids"]
+
+            mapping[cand] = token_ids[-1]
+            
+        return mapping
+
+
+class MultimodalCausalWrapper(BaseWrapper):
+    def __init__(self, model_name: str ='Qwen/Qwen3-VL-8B-Instruct', device: str = "cuda", cache_dir: str = None, n_candidates: int = 5, max_new_tokens: int = 10):
+        self.device = device
+        self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=False, cache_dir=cache_dir)
+        self.processor.tokenizer.padding_side = "left"
+        # Expose tokenizer for BaseWrapper utilities (choice2token_id)
+        self.tokenizer = self.processor.tokenizer
+        self.model = AutoModelForImageTextToText.from_pretrained(
+            model_name, 
+            device_map="auto", 
+            dtype=torch.float16,
+            trust_remote_code=True,
+            cache_dir=cache_dir
+        )
+
+        self._n_candidates = n_candidates
+        self._choice2token_id = {}
+        self.max_new_tokens = max_new_tokens
+        
+       
+    def generate(
+        self, 
+        prompts: List[str], 
+        images: Optional[List[Image.Image]] = None, 
+        **kwargs
+    ) -> List[PredictionOutput]:
+
+            
+        #Prepare Inputs
+        base_dir = Path(__file__).resolve().parent.parent / "mind2web" / "llm_prompt.json"       
+        few_shots = json.load(open(base_dir, "r"))
+        formatted_inputs = []
+        for i, prompt in enumerate(prompts):
+            messages = copy.deepcopy(few_shots)
+            content = [{"type": "text", "text": prompt}]
+            if images and images[i]:
+                content.insert(0, {"type": "image", "image": images[i]})
+            messages.append({"role": "user", "content": content})
+            formatted_inputs.append(messages)
+
+
+        text_prompts = self.processor.apply_chat_template(formatted_inputs, tokenize=False, add_generation_prompt=True)
+        inputs = self.processor(
+            text=text_prompts,
+            images=images if images else None,
+            padding=True,
+            return_tensors="pt"
+        ).to(self.model.device)
+
+        with torch.inference_mode():
+            outputs = self.model.generate(
+                **inputs,
+                return_dict_in_generate=True,
+                output_scores=True,
+                do_sample=False,         
+                max_new_tokens=self.max_new_tokens,
+                **kwargs
+            )
+
+        
+        # Slice off the prompt portion
+        input_len = inputs.input_ids.shape[1]
+        generated_ids = outputs.sequences[:, input_len:]
+        decoded_texts = self.processor.batch_decode(generated_ids, skip_special_tokens=True)
+
+       
+        first_token_logits = outputs.scores[0] 
+        results = []
+        for i, text in enumerate(decoded_texts):
+            choices_logits = {
+                cand_str: first_token_logits[i, cand_id].item() 
+                for cand_str, cand_id in self.choice2token_id.items()
+                }
+            
+            results.append({"pred_text": text.strip(), "choices_logits": choices_logits})
+
+        return results
+
+class TextSeq2SeqWrapper(BaseWrapper):
+    def __init__(self, model_name: str = "google/flan-t5-xl", device: str = "cuda", cache_dir: str = None, n_candidates: int = 5):
+        self.device = device
+        self._n_candidates = n_candidates
+        self._choice2token_id = {}
+        if model_name == "osunlp/MindAct_ActionPrediction_flan-t5-xl":
+            self.tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-xl", cache_dir=cache_dir)
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
+
+        if device == "auto":
+            self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name, cache_dir=cache_dir, device_map="auto")
+        else:
+            self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name, cache_dir=cache_dir).to(device)
+        
+        
+
+    def generate(self, prompts: List[str], images: Optional[List] = None, **kwargs):
+        # Generic check: This architecture physically cannot see images
+        if images and any(img is not None for img in images):
+            print(f"Warning: {self.__class__.__name__} ignores images.")
+
+        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True).to(self.device)
+        
+        with torch.inference_mode():
+            output_ids = self.model.generate(**inputs, **kwargs)
+            
+        # Seq2Seq models return ONLY the new tokens. No slicing needed.
+        return self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+
+def get_wrapper(model_name: str, cache_dir: str = None) -> BaseWrapper:
+    # Logic to auto-detect architecture
+    if model_name.lower() == 'finetuned':
+        return TextSeq2SeqWrapper(model_name="google/flan-t5-xl", cache_dir=cache_dir)
+
+    elif model_name.lower() == "qwen":
+        return MultimodalCausalWrapper(model_name="Qwen/Qwen3-VL-8B-Instruct", cache_dir=cache_dir)
+    
+    else:
+        return MultimodalCausalWrapper(model_name)
+    
+
 def filter_choices(choices_str: str, pred_set: list[str]):
     """Filter the choices string to only include those in pred_set.
     X-s IMPORTANT: if 'A' (reserved label) is not in the pred_set (unlikely)
@@ -620,10 +783,6 @@ def re_evaluate_with_oracle_batch(
     ]
     return pd.DataFrame(outputs, columns=cols)
 
-
-
-
-
 class ShrinkageTokenProcessor(LogitsProcessor):
     def __init__(self, token_ids, shrinkage=0, device=None):
         self.shrinkage = shrinkage # Shrinkage penalty
@@ -646,6 +805,31 @@ class ShrinkageTokenProcessor(LogitsProcessor):
         self.is_first_token = False
         return scores
 
+
+def generate_batch_records(model: BaseWrapper, batch: dict, split_name: str = '', temperature=1, shrinkage=0):
+    prompts = batch["prompt"]
+    images = batch.get("screenshot_image", None)
+    outputs = model.generate(prompts, images=images)
+
+    print(f"Generated {len(outputs)} records for split {split_name}")
+    print(outputs)
+
+    records = []
+    for i, out in enumerate(outputs):
+        records.append(
+            {
+                "annotation_id": batch["annotation_id"][i],
+                "action_uid": batch["action_uid"][i],
+                "pred_text": out['pred_text'],
+                "target_text": batch['target_text'][i],
+                "choices_logits": out.get('choices_logits', None),
+                "test_split": split_name,
+            }
+        )
+    
+    
+    return records
+    
 
 def batch_generate(model, tokenizer, loader, split_name = None, temperature=1, shrinkage=0):
     records = []
@@ -714,4 +898,3 @@ def evaluate_splits(data_sets:dict, model, tokenizer, batch_size=7, num_iteratio
     
     final_df = pd.concat(all_splits, ignore_index=True)
     return final_df
-
