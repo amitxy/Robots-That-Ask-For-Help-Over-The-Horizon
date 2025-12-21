@@ -1,5 +1,7 @@
 
 import textwrap
+from string import Template
+
 standard_prompt_template = textwrap.dedent(
 """
 $html
@@ -13,6 +15,39 @@ What should be the next action? Please select from the following choices (If the
 $choices
 """
 )
+
+
+mind2web_prompt_template = textwrap.dedent(
+    """
+Based on the HTML webpage above, try to complete the following task:
+Task: $task
+Previous actions:
+$prev_actions
+What should be the next action? Please select from the following choices (If the correct action is not in the page above, please select A. 'None of the above'):
+
+$choices
+"""
+)
+
+
+mind2web_prompt_template_with_html_context= textwrap.dedent(
+    """
+    '''
+$html
+    '''
+
+Based on the HTML webpage above, try to complete the following task:
+Task: $task
+Previous actions:
+$prev_actions
+What should be the next action? Please select from the following choices (If the correct action is not in the page above, please select A. 'None of the above'):
+
+$choices
+"""
+)
+
+
+
 # Templates uses $ instead of {}
 # Change to human orale
 oracle_prompt_template = textwrap.dedent(
@@ -100,6 +135,27 @@ human_prompt_template = textwrap.dedent(
     Your Response:  
 """)
 
+
+def get_prompt_template(name: str):
+    """
+    Return a Template object for the given prompt name.
+
+    Valid names: "standard", "mind2web", "oracle", "re_eval", "human".
+    """
+    name = name.lower()
+    if name == "standard":
+        return Template(standard_prompt_template)
+    if name == "mind2web":
+        return Template(mind2web_prompt_template)
+    if name == "mind2web_with_context":
+        return Template(mind2web_prompt_template_with_html_context)
+    if name == "oracle":
+        return Template(oracle_prompt_template)
+    if name == "re_eval":
+        return Template(re_eval_prompt_template)
+    if name == "human":
+        return Template(human_prompt_template)
+    raise ValueError(f"Unknown prompt template name: {name}")
 
 
 
