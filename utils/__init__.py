@@ -10,6 +10,5 @@ from utils.helpers import (
     reload
 )
 
-from utils import llm_utils as llm
 from utils import plot_utils as plot
 from utils import metrics
