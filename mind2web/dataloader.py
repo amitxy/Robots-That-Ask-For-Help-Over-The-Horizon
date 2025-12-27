@@ -186,7 +186,7 @@ def format_input_elements(
         "html_context": tree_repr,
         "task": sample.get("confirmed_task"),
         "previous_actions": prev_actions,
-        "choices_str": choices_str,
+        "choices": choices_str,
         "target_text": target_text,
     }
 
@@ -209,12 +209,6 @@ def _resize_image(image: Image.Image, max_image_edge=None) -> Image.Image:
     scale = max_image_edge / float(longer)
     new_size = (int(w * scale), int(h * scale))
     return image.resize(new_size, Image.LANCZOS)
-
-
-
-
-
-
 
 
 class PromptView:
@@ -593,6 +587,67 @@ class MultiChoiceDatasetPrompt(Dataset):
 
             model_input["screenshot_image"] = image
         return model_input
+    
+
+class MultiChoiceDatasetRaw(Dataset):
+    """
+    Similar to MultiChoiceDataset but builds a single prompt string using a
+    provided template and format_input_elements. Returns raw prompt components
+    (no tokenization) for downstream handling.
+    """
+
+    def __init__(
+        self,
+        data,
+        split_name: str = "test",
+        num_candidates: int = 5,
+        add_screenshot: bool = False,
+        max_image_edge: int = 720,
+
+    ):
+        self.data = data
+        self.num_candidates = int(num_candidates)
+        self.split_name = split_name
+        self.add_screenshot = add_screenshot
+
+        # Downscale large images to save VRAM; keep aspect ratio.
+        self.max_image_edge = max_image_edge
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        sample = self.data[idx]
+
+        all_cands = sample["pos_candidates"] + sample["neg_candidates"]
+        all_cands_sorted = sorted(
+            all_cands, key=lambda c: c.get("rank", float("inf"))
+        )[: self.num_candidates]
+
+        top_pos = [c for c in all_cands_sorted if c in sample["pos_candidates"]]
+        
+        gt = -1
+        if top_pos:
+            best_rank = min(c.get("rank", float("inf")) for c in top_pos)
+            best_pos = [c for c in top_pos if c.get("rank", float("inf")) == best_rank]
+            pos_candidate = random.choice(best_pos)
+            gt = _extract_candidate_ids(pos_candidate["backend_node_id"])
+            
+        candidate_ids = [ _extract_candidate_ids(c["backend_node_id"]) for c in all_cands_sorted]
+
+        model_input = format_input_elements(sample, candidate_ids, gt)
+
+        if self.add_screenshot:
+            screenshot = sample.get("screenshot_image")
+            if screenshot is not None:
+                image = Image.open(screenshot).convert("RGB")
+                image = _resize_image(image, self.max_image_edge)
+            else:
+                image = None
+
+            model_input["screenshot_image"] = image
+        return model_input
+
 
 def get_data_split(data_dir, split_file, candidate_results=None, is_train=False, cache_dir=None):
     def flatten_actions(samples):

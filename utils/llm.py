@@ -2,6 +2,7 @@ from mind2web.dataloader import MultiChoiceDataset
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoModelForImageTextToText, AutoProcessor, AutoTokenizer, LogitsProcessor, LogitsProcessorList, AutoModelForSeq2SeqLM
 from string import Template
 import pandas as pd
@@ -20,7 +21,7 @@ import gc
 import utils
 from utils import log_response
 from utils.helpers import parse_output  # for parse_output
-from mind2web.dataloader import MultiChoiceDataset, multichoice_collate_fn, choice2token_id
+from mind2web.dataloader import MultiChoiceDataset, multichoice_collate_fn, raw_data_collate_fn, choice2token_id
 
 import json, copy
 from pathlib import Path
@@ -368,7 +369,6 @@ class Oracle:
         return reply_text
 
 
-
 # This represents: {'pred_text': "[Model Output]", 'choices_logits': {'A': 5.2, 'B': 1.1, ..., 'F': 0.0}}
 PredictionOutput = Dict[str, Union[str, Dict[str, float]]]
 
@@ -411,7 +411,12 @@ class BaseWrapper(ABC):
 
 
 class MultimodalCausalWrapper(BaseWrapper):
-    def __init__(self, model_name: str ='Qwen/Qwen3-VL-8B-Instruct', device: str = "cuda", cache_dir: str = None, n_candidates: int = 5, max_new_tokens: int = 10):
+    def __init__(self,
+                 model_name: str ='Qwen/Qwen3-VL-8B-Instruct', 
+                 device: str = "cuda",
+                 cache_dir: str = None,
+                 n_candidates: int = 5, 
+                 max_new_tokens: int = 10):
         self.device = device
         self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=False, cache_dir=cache_dir)
         self.processor.tokenizer.padding_side = "left"
@@ -433,17 +438,20 @@ class MultimodalCausalWrapper(BaseWrapper):
     def generate(
         self, 
         prompts: List[str], 
-        images: Optional[List[Image.Image]] = None, 
+        images: Optional[List[Image.Image]] = None,
         **kwargs
     ) -> List[PredictionOutput]:
-
-            
+        
+        use_few_shots = kwargs.pop('use_few_shots', False)
+         
         #Prepare Inputs
-        base_dir = Path(__file__).resolve().parent.parent / "mind2web" / "llm_prompt.json"       
-        few_shots = json.load(open(base_dir, "r"))
+        few_shots = []
+        if use_few_shots:
+            base_dir = Path(__file__).resolve().parent.parent / "mind2web" / "llm_prompt.json"       
+            few_shots = json.load(open(base_dir, "r"))
         formatted_inputs = []
         for i, prompt in enumerate(prompts):
-            messages = copy.deepcopy(few_shots)
+            messages = copy.deepcopy(few_shots) if use_few_shots else []
             content = [{"type": "text", "text": prompt}]
             if images and images[i]:
                 content.insert(0, {"type": "image", "image": images[i]})
@@ -452,9 +460,16 @@ class MultimodalCausalWrapper(BaseWrapper):
 
 
         text_prompts = self.processor.apply_chat_template(formatted_inputs, tokenize=False, add_generation_prompt=True)
+        image_inputs = None
+        if images:
+            if isinstance(images, list):
+                if any(img is not None for img in images):
+                    image_inputs = images
+            else:
+                image_inputs = [images]
         inputs = self.processor(
             text=text_prompts,
-            images=images if images else None,
+            images=image_inputs,
             padding=True,
             return_tensors="pt"
         ).to(self.model.device)
@@ -493,6 +508,8 @@ class TextSeq2SeqWrapper(BaseWrapper):
         self.device = device
         self._n_candidates = n_candidates
         self._choice2token_id = {}
+        self.max_context_len = 512
+
         if model_name == "osunlp/MindAct_ActionPrediction_flan-t5-xl":
             self.tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-xl", cache_dir=cache_dir)
         else:
@@ -503,33 +520,72 @@ class TextSeq2SeqWrapper(BaseWrapper):
         else:
             self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name, cache_dir=cache_dir).to(device)
         
-        
-
-    def generate(self, prompts: List[str], images: Optional[List] = None, **kwargs):
+    def generate(self, prompts: List[str], html_contexts: List[str], images: Optional[List] = None, **kwargs):
         # Generic check: This architecture physically cannot see images
         if images and any(img is not None for img in images):
             print(f"Warning: {self.__class__.__name__} ignores images.")
 
-        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True).to(self.device)
-        
+        if len(prompts) != len(html_contexts):
+            raise ValueError("prompts and html_contexts must have the same length.")
+
+        tokenized_contexts = self.tokenizer(
+            html_contexts,
+            truncation=True,
+            max_length=self.max_context_len,
+            add_special_tokens=False,
+            return_tensors="pt",
+            padding=False,
+        )
+        tokenized_prompts = self.tokenizer(
+            prompts,
+            truncation=True,
+            max_length=self.max_context_len,
+            add_special_tokens=True,
+            return_tensors="pt",
+            padding=False,
+        )
+
+        merged_ids = [torch.cat([c, p]) for c, p in zip(tokenized_contexts["input_ids"], tokenized_prompts["input_ids"])]
+        merged_masks = [torch.cat([c, p]) for c, p in zip(tokenized_contexts["attention_mask"], tokenized_prompts["attention_mask"])]
+
+        pad_id = self.tokenizer.pad_token_id or 0
+        input_ids = pad_sequence(merged_ids, batch_first=True, padding_value=pad_id)
+        attention_mask = pad_sequence(merged_masks, batch_first=True, padding_value=0)
+
+        if self.device == "auto" or self.device == "cuda":
+            input_ids = input_ids.to("cuda")
+            attention_mask = attention_mask.to("cuda")
+
+        inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
+
         with torch.inference_mode():
-            output_ids = self.model.generate(**inputs, **kwargs)
+            output_ids = self.model.generate(**inputs,do_sample=False, output_scores = True, return_dict_in_generate=True, **kwargs)
             
         # Seq2Seq models return ONLY the new tokens. No slicing needed.
-        return self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+        # outputs.scores is a tuple (one per generated token). Use first step for choice logits.
+        decoded_texts = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+        first_token_logits = output_ids.scores[0]
+        results = []
+        for i, text in enumerate(decoded_texts):
+            choices_logits = {
+                cand_str: first_token_logits[i, cand_id].item()
+                for cand_str, cand_id in self.choice2token_id.items()
+            }
+            results.append({"pred_text": text.strip(), "choices_logits": choices_logits})
 
-def get_wrapper(model_name: str, cache_dir: str = None) -> BaseWrapper:
+        return results
+
+def get_wrapper(model_name: str, cache_dir: str = None, **kwargs) -> BaseWrapper:
     # Logic to auto-detect architecture
     if model_name.lower() == 'finetuned':
         return TextSeq2SeqWrapper(model_name="google/flan-t5-xl", cache_dir=cache_dir)
 
     elif model_name.lower() == "qwen":
-        return MultimodalCausalWrapper(model_name="Qwen/Qwen3-VL-8B-Instruct", cache_dir=cache_dir)
+        return MultimodalCausalWrapper(model_name="Qwen/Qwen3-VL-8B-Instruct", cache_dir=cache_dir, **kwargs)
     
     else:
-        return MultimodalCausalWrapper(model_name)
+        return MultimodalCausalWrapper(model_name, cache_dir=cache_dir, **kwargs)
     
-
 def filter_choices(choices_str: str, pred_set: list[str]):
     """Filter the choices string to only include those in pred_set.
     X-s IMPORTANT: if 'A' (reserved label) is not in the pred_set (unlikely)
@@ -806,13 +862,10 @@ class ShrinkageTokenProcessor(LogitsProcessor):
         return scores
 
 
-def generate_batch_records(model: BaseWrapper, batch: dict, split_name: str = '', temperature=1, shrinkage=0):
+def generate_batch_records(model: BaseWrapper, batch: dict, temperature=1, shrinkage=0, use_few_shots: bool = False, **kwargs) -> list[dict]:
     prompts = batch["prompt"]
     images = batch.get("screenshot_image", None)
-    outputs = model.generate(prompts, images=images)
-
-    print(f"Generated {len(outputs)} records for split {split_name}")
-    print(outputs)
+    outputs = model.generate(prompts, images=images, use_few_shots=use_few_shots)
 
     records = []
     for i, out in enumerate(outputs):
@@ -823,12 +876,48 @@ def generate_batch_records(model: BaseWrapper, batch: dict, split_name: str = ''
                 "pred_text": out['pred_text'],
                 "target_text": batch['target_text'][i],
                 "choices_logits": out.get('choices_logits', None),
-                "test_split": split_name,
             }
         )
     
     
     return records
+
+
+def collect_prompt_predictions(
+    model: BaseWrapper,
+    datasets: dict,
+    batch_size: int = 3,
+    backup: bool = False,
+    backup_path: str = "prompt_predictions_backup.pkl",
+    **kwargs,
+) -> pd.DataFrame:
+    """
+    Iterate over prompt datasets (e.g., MultiChoiceDatasetPrompt per split),
+    generate model outputs, and return a single DataFrame of records.
+    """
+    records: list[dict] = []
+    i = 0
+    first = False
+    for split_name, dataset in datasets.items():
+        print(f"Processing split: {split_name} ({len(dataset)} samples)")
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=raw_data_collate_fn,
+        )
+        for batch in tqdm(loader):
+            i += len(batch)
+            batch_records = generate_batch_records(model, batch, **kwargs)
+            for rec in batch_records:
+                rec["test_split"] = split_name
+            records.extend(batch_records)
+            if backup and (i % 100 == 0) or (i % 10 == 0 and not first):
+                first = True
+                pd.DataFrame(records).to_pickle(backup_path)
+    
+    return pd.DataFrame(records)
     
 
 def batch_generate(model, tokenizer, loader, split_name = None, temperature=1, shrinkage=0):

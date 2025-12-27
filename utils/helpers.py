@@ -93,7 +93,7 @@ def _logits_to_probs(logits_dict, logits_temp: float = 1) -> dict:
         probs = torch.softmax(t / float(logits_temp), dim=-1).tolist()
         return dict(zip(labels, probs))
 
-def add_eval_columns(df: pd.DataFrame, threshold: float = None, logits_temp: float = 1, to_save: bool = False, save_path: str = None) -> pd.DataFrame:
+def add_eval_columns(df: pd.DataFrame, threshold: float = None, logits_temp: float = 1, to_save: bool = False, save_path: str = None, add_noise=False) -> pd.DataFrame:
     """
     Add derived evaluation columns.
 
@@ -112,7 +112,8 @@ def add_eval_columns(df: pd.DataFrame, threshold: float = None, logits_temp: flo
     df['step_idx'] = df.groupby('annotation_id').cumcount()
     df["choices_probs"] = df["choices_logits"].apply(lambda x: _logits_to_probs(x, logits_temp=logits_temp))
 
-    for col, suffix in (("target_text", "target"), ("output_text","pred")):
+    col = "output_text" if "output_text" in df.columns else "pred_text"
+    for col, suffix in (("target_text", "target"), (col,"pred")):
         parsed = df[col].apply(lambda t: parse_output(t))
         df[f"{suffix}_label"]= parsed.apply(lambda x: x[0])
         df[f"{suffix}_action"] = parsed.apply(lambda x: x[1])
@@ -122,9 +123,23 @@ def add_eval_columns(df: pd.DataFrame, threshold: float = None, logits_temp: flo
     df["target_prob"] = df.apply(lambda r: r["choices_probs"].get(r["target_label"], 0.0),axis=1)
     df["pred_prob"] = df.apply(lambda r: r["choices_probs"].get(r["pred_label"], 0.0), axis=1)
 
-
+    
     if threshold is not None:
-        df["pred_set"] = df['choices_probs'].apply(lambda row: [ label for label, prob in row.items() if 1 - prob < threshold])
+        epsilon = 1e-6
+        noise = (
+            # np.random.default_rng(42).uniform(0, epsilon, size=len(df))
+            np.random.uniform(0, epsilon, size=len(df))
+            if add_noise
+            else np.zeros(len(df))
+        )
+        df["pred_set"] = df.apply(
+            lambda r: [
+                label
+                for label, prob in r["choices_probs"].items()
+                if 1 - prob < threshold
+            ],
+            axis=1,
+        )
         df["pred_set_size"] = df["pred_set"].apply(len)
 
     if to_save and save_path:
