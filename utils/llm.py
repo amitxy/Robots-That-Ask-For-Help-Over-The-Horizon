@@ -504,7 +504,7 @@ class MultimodalCausalWrapper(BaseWrapper):
         return results
 
 class TextSeq2SeqWrapper(BaseWrapper):
-    def __init__(self, model_name: str = "google/flan-t5-xl", device: str = "cuda", cache_dir: str = None, n_candidates: int = 5):
+    def __init__(self, model_name: str = "google/flan-t5-xl", device: str = "auto", cache_dir: str = None, n_candidates: int = 5):
         self.device = device
         self._n_candidates = n_candidates
         self._choice2token_id = {}
@@ -559,23 +559,34 @@ class TextSeq2SeqWrapper(BaseWrapper):
         inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
 
         with torch.inference_mode():
-            output_ids = self.model.generate(**inputs,do_sample=False, output_scores = True, return_dict_in_generate=True, **kwargs)
+            output = self.model.generate(
+                **inputs,
+                do_sample=False,
+                output_scores=True,
+                return_dict_in_generate=True,
+                **kwargs,
+            )
             
         # Seq2Seq models return ONLY the new tokens. No slicing needed.
         # outputs.scores is a tuple (one per generated token). Use first step for choice logits.
-        decoded_texts = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-        first_token_logits = output_ids.scores[0]
+        decoded_texts = self.tokenizer.batch_decode(output.sequences, skip_special_tokens=True)
+        first_token_logits = output.scores[0] if output.scores else None
         results = []
         for i, text in enumerate(decoded_texts):
-            choices_logits = {
-                cand_str: first_token_logits[i, cand_id].item()
-                for cand_str, cand_id in self.choice2token_id.items()
-            }
+            choices_logits = None
+            if first_token_logits is not None:
+                choices_logits = {
+                    cand_str: first_token_logits[i, cand_id].item()
+                    for cand_str, cand_id in self.choice2token_id.items()
+                }
             results.append({"pred_text": text.strip(), "choices_logits": choices_logits})
 
         return results
 
 def get_wrapper(model_name: str, cache_dir: str = None, **kwargs) -> BaseWrapper:
+
+    torch.cuda.empty_cache()
+
     # Logic to auto-detect architecture
     if model_name.lower() == 'finetuned':
         return TextSeq2SeqWrapper(model_name="google/flan-t5-xl", cache_dir=cache_dir)

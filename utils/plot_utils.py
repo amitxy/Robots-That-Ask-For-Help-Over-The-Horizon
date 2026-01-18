@@ -150,7 +150,25 @@ def coverage_vs_set_size(df, alpha_line: float = 0.9, method_col: str = 'method'
     plt.tight_layout()
     plt.show()
 
+def threshold_by_step(df, step_col="step_idx", threshold_col="threshold", model_col=None):
+    """
+    Plot threshold as a function of step index.
+    If model_col is provided, plots a line per model.
+    """
+    if model_col:
+        for name, g in df.groupby(model_col):
+            thr = g.groupby(step_col)[threshold_col].mean()
+            plt.plot(thr.index, thr.values, label=str(name))
+        plt.legend()
+    else:
+        thr = df.groupby(step_col)[threshold_col].mean()
+        plt.plot(thr.index, thr.values)
 
+    plt.xlabel("Step index")
+    plt.ylabel("Threshold")
+    plt.title("Threshold vs. Step index")
+    plt.tight_layout()
+    plt.show()
 
 ########
 # def ask_rate_vs_target_prob(df):
@@ -548,7 +566,6 @@ def quick_plot(metrics_df: pd.DataFrame,x='fp_rate_per_task',y='risk_level', met
     plt.show()
 
 
-
 def plot_episode_reliability_multi(
     df: pd.DataFrame,
     methods: Optional[Sequence[str]] = None,
@@ -712,3 +729,96 @@ def plot_episode_reliability_multi(
 
     plt.show()
     # return fig, ax
+
+
+def accuracy_by_step(df, step_col="step_idx", correct_col="correct", model_col=None):
+    """
+    Plot accuracy as a function of step index.
+    If model_col is provided, plots a line per model.
+    """
+    if model_col:
+        for name, g in df.groupby(model_col):
+            acc = g.groupby(step_col)[correct_col].mean()
+            plt.plot(acc.index, acc.values, label=str(name))
+        plt.legend()
+    else:
+        acc = df.groupby(step_col)[correct_col].mean()
+        plt.plot(acc.index, acc.values)
+
+    plt.xlabel("Step index")
+    plt.ylabel("Accuracy")
+    plt.title("Accuracy vs. Step index")
+    plt.tight_layout()
+    plt.show()
+
+
+def coverage_by_step(df, step_col="step_idx", coverage_col="covered", model_col=None):
+    """
+    Plot coverage (target in prediction set) as a function of step index.
+    If model_col is provided, plots a line per model.
+    """
+    if model_col:
+        for name, g in df.groupby(model_col):
+            cov = g.groupby(step_col)[coverage_col].mean()
+            plt.plot(cov.index, cov.values, label=str(name))
+        plt.legend()
+    else:
+        cov = df.groupby(step_col)[coverage_col].mean()
+        plt.plot(cov.index, cov.values)
+
+    plt.xlabel("Step index")
+    plt.ylabel("Coverage")
+    plt.title("Coverage vs. Step index")
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_coverage_vs_set_size(
+    df,
+    method_col="method",
+    probs_col="choices_probs",
+    target_col="target_label",
+    max_k=None,
+):
+    """
+    Plot coverage vs. prediction set size using top-k probabilities.
+    For k=1 this equals accuracy.
+    """
+    work = df.copy()
+
+    # Precompute sorted labels by prob (desc)
+    work["_sorted_labels"] = work[probs_col].apply(
+        lambda d: [k for k, _ in sorted(d.items(), key=lambda kv: (-kv[1], kv[0]))] if isinstance(d, dict) else []
+    )
+
+    # Determine max_k
+    k_max_data = work["_sorted_labels"].apply(len).max()
+    if max_k is None:
+        max_k = k_max_data
+    else:
+        max_k = min(max_k, k_max_data)
+
+    methods = work[method_col].unique().tolist() if method_col in work.columns else [None]
+
+    plt.figure()
+    for m in methods:
+        sub = work if m is None else work[work[method_col] == m]
+        if sub.empty:
+            continue
+
+        coverages = []
+        ks = range(1, max_k + 1)
+        for k in ks:
+            covered = sub.apply(lambda r: r[target_col] in r["_sorted_labels"][:k], axis=1)
+            coverages.append(covered.mean())
+
+        label = str(m) if m is not None else "all"
+        plt.plot(list(ks), coverages, marker="o", label=label)
+
+    plt.xlabel("Prediction set size (top‑k)")
+    plt.ylabel("Coverage")
+    plt.title("Coverage vs. Prediction Set Size (Top‑k)")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
